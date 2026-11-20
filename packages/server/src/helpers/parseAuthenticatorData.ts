@@ -2,6 +2,7 @@ import {
   type AuthenticationExtensionsAuthenticatorOutputs,
   decodeAuthenticatorExtensions,
 } from './decodeAuthenticatorExtensions.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
 import { isoCBOR, isoUint8Array } from './iso/index.ts';
 import type { COSEPublicKey } from './cose.ts';
 import type { Uint8Array_ } from '../types/index.ts';
@@ -13,15 +14,22 @@ export function parseAuthenticatorData(
   authData: Uint8Array_,
 ): ParsedAuthenticatorData {
   if (authData.byteLength < 37) {
-    throw new Error(
-      `Authenticator data was ${authData.byteLength} bytes, expected at least 37 bytes`,
-    );
+    throw new SimpleWebAuthnError({
+      message: `Authenticator data was ${authData.byteLength} bytes, expected at least 37 bytes`,
+      code: 'INVALID_AUTHENTICATOR_DATA',
+    });
   }
 
   let pointer = 0;
   const dataView = isoUint8Array.toDataView(authData);
 
   const rpIdHash = authData.slice(pointer, pointer += 32);
+  if (rpIdHash.byteLength !== 32) {
+    throw new SimpleWebAuthnError({
+      message: `rpIdHash was ${rpIdHash.byteLength} bytes, expected exactly 32 bytes`,
+      code: 'INVALID_AUTHENTICATOR_DATA',
+    });
+  }
 
   const flagsBuf = authData.slice(pointer, pointer += 1);
   const flagsInt = flagsBuf[0];
@@ -47,12 +55,45 @@ export function parseAuthenticatorData(
   let credentialPublicKey: Uint8Array_ | undefined = undefined;
 
   if (flags.at) {
+    if (authData.byteLength < pointer + 16) {
+      throw new SimpleWebAuthnError({
+        message:
+          `AT flag was set but AAGUID was truncated: expected 16 bytes at offset ${pointer}, only ${
+            authData.byteLength - pointer
+          } remained`,
+        code: 'INVALID_AUTHENTICATOR_DATA',
+      });
+    }
     aaguid = authData.slice(pointer, pointer += 16);
 
+    if (authData.byteLength < pointer + 2) {
+      throw new SimpleWebAuthnError({
+        message:
+          `AT flag was set but credential ID length was truncated: expected 2 bytes at offset ${pointer}, only ${
+            authData.byteLength - pointer
+          } remained`,
+        code: 'INVALID_AUTHENTICATOR_DATA',
+      });
+    }
     const credIDLen = dataView.getUint16(pointer);
     pointer += 2;
 
+    if (authData.byteLength < pointer + credIDLen) {
+      throw new SimpleWebAuthnError({
+        message: `Credential ID length of ${credIDLen} bytes exceeded the ${
+          authData.byteLength - pointer
+        } remaining bytes of authenticator data`,
+        code: 'INVALID_AUTHENTICATOR_DATA',
+      });
+    }
     credentialID = authData.slice(pointer, pointer += credIDLen);
+
+    if (authData.byteLength <= pointer) {
+      throw new SimpleWebAuthnError({
+        message: 'AT flag was set but credential public key was missing',
+        code: 'INVALID_AUTHENTICATOR_DATA',
+      });
+    }
 
     /**
      * Firefox 117 incorrectly CBOR-encodes authData when EdDSA (-8) is used for the public key.
@@ -73,26 +114,36 @@ export function parseAuthenticatorData(
       authData[pointer] = 0xa4;
     }
 
-    // Decode the next CBOR item in the buffer, then re-encode it back to a Buffer
-    const firstDecoded = isoCBOR.decodeFirst<COSEPublicKey>(
-      authData.slice(pointer),
-    );
-    const firstEncoded = Uint8Array.from(
-      /**
-       * Casting to `Map` via `as unknown` here because TS doesn't make it possible to define Maps
-       * with discrete keys and properties with known types per pair, and CBOR libs typically parse
-       * CBOR Major Type 5 to `Map` because you can have numbers for keys. A `COSEPublicKey` can be
-       * generalized as "a Map with numbers for keys and either numbers or bytes for values" though.
-       * If this presumption falls apart then other parts of verification later on will fail so we
-       * should be safe doing this here.
-       */
-      isoCBOR.encode(firstDecoded as unknown as Map<number, number | Uint8Array>),
-    );
-
-    if (foundBadCBOR) {
-      // Restore the bit we changed so that `authData` is the same as it came in and won't break
-      // signature verification.
-      authData[pointer] = 0xa3;
+    let firstEncoded: Uint8Array_;
+    try {
+      // Decode the next CBOR item in the buffer, then re-encode it back to a Buffer
+      const firstDecoded = isoCBOR.decodeFirst<COSEPublicKey>(
+        authData.slice(pointer),
+      );
+      firstEncoded = Uint8Array.from(
+        /**
+         * Casting to `Map` via `as unknown` here because TS doesn't make it possible to define Maps
+         * with discrete keys and properties with known types per pair, and CBOR libs typically parse
+         * CBOR Major Type 5 to `Map` because you can have numbers for keys. A `COSEPublicKey` can be
+         * generalized as "a Map with numbers for keys and either numbers or bytes for values" though.
+         * If this presumption falls apart then other parts of verification later on will fail so we
+         * should be safe doing this here.
+         */
+        isoCBOR.encode(firstDecoded as unknown as Map<number, number | Uint8Array>),
+      );
+    } catch (err) {
+      const _err = err as Error;
+      throw new SimpleWebAuthnError({
+        message: `Error decoding credential public key: ${_err.message}`,
+        code: 'INVALID_AUTHENTICATOR_DATA',
+        cause: _err,
+      });
+    } finally {
+      if (foundBadCBOR) {
+        // Restore the bit we changed so that `authData` is the same as it came in and won't break
+        // signature verification.
+        authData[pointer] = 0xa3;
+      }
     }
 
     credentialPublicKey = firstEncoded;
@@ -103,12 +154,29 @@ export function parseAuthenticatorData(
   let extensionsDataBuffer: Uint8Array_ | undefined = undefined;
 
   if (flags.ed) {
+    if (authData.byteLength <= pointer) {
+      throw new SimpleWebAuthnError({
+        message: 'ED flag was set but extension data was missing',
+        code: 'INVALID_AUTHENTICATOR_DATA',
+      });
+    }
+
     /**
      * Typing here feels a little sloppy but we're immediately CBOR-encoding this back to bytes to
      * more diligently parse via `decodeAuthenticatorExtensions()` so :shrug:
      */
     type AuthenticatorExtensionData = Map<string, Uint8Array>;
-    const firstDecoded = isoCBOR.decodeFirst<AuthenticatorExtensionData>(authData.slice(pointer));
+    let firstDecoded: AuthenticatorExtensionData;
+    try {
+      firstDecoded = isoCBOR.decodeFirst<AuthenticatorExtensionData>(authData.slice(pointer));
+    } catch (err) {
+      const _err = err as Error;
+      throw new SimpleWebAuthnError({
+        message: `Error decoding extension data: ${_err.message}`,
+        code: 'INVALID_AUTHENTICATOR_DATA',
+        cause: _err,
+      });
+    }
     extensionsDataBuffer = Uint8Array.from(isoCBOR.encode(firstDecoded));
     extensionsData = decodeAuthenticatorExtensions(extensionsDataBuffer);
     pointer += extensionsDataBuffer.byteLength;
@@ -116,7 +184,10 @@ export function parseAuthenticatorData(
 
   // Pointer should be at the end of the authenticator data, otherwise too much data was sent
   if (authData.byteLength > pointer) {
-    throw new Error('Leftover bytes detected while parsing authenticator data');
+    throw new SimpleWebAuthnError({
+      message: 'Leftover bytes detected while parsing authenticator data',
+      code: 'INVALID_AUTHENTICATOR_DATA',
+    });
   }
 
   return _parseAuthenticatorDataInternals.stubThis({

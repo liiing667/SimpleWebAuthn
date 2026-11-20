@@ -29,7 +29,13 @@ export function decodeFirst<Type>(input: Uint8Array_): Type {
   const _input = new Uint8Array(input);
   const decoded = tinyCbor.decodePartialCBOR(_input, 0) as [Type, number];
 
-  const [first] = decoded;
+  const [first, nextOffset] = decoded;
+
+  // tiny-cbor silently clamps some truncated values (e.g. text and byte strings) instead of
+  // throwing, so make sure the decoder didn't read past the end of the input
+  if (nextOffset > _input.byteLength) {
+    throw new Error('CBOR data was truncated');
+  }
 
   return first;
 }
