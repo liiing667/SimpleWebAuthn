@@ -284,7 +284,7 @@ app.post('/verify-authentication', async (req, res) => {
 
   const { verified, authenticationInfo } = verification;
 
-  if (verified) {
+  if (verified && authenticationInfo) {
     // Update the credential's counter in the DB to the newest count in the authentication
     dbCredential.counter = authenticationInfo.newCounter;
   }

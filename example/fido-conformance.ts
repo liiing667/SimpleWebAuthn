@@ -282,7 +282,7 @@ fidoConformanceRouter.post('/assertion/result', async (req, res) => {
 
   const { verified, authenticationInfo } = verification;
 
-  if (verified) {
+  if (verified && authenticationInfo) {
     existingCredential.counter = authenticationInfo.newCounter;
   }
 

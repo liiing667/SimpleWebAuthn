@@ -36,6 +36,9 @@ export type VerifyAuthenticationResponseOpts = Parameters<typeof verifyAuthentic
  * @param credential - An internal {@link WebAuthnCredential} corresponding to `id` in the authentication response
  * @param expectedType **(Optional)** - The response type expected ('webauthn.get')
  * @param requireUserVerification **(Optional)** - Enforce user verification by the authenticator (via PIN, fingerprint, etc...) Defaults to `true`
+ * @param counterPolicy **(Optional)** - Rules for validating the authenticator's signature counter
+ * @param counterPolicy.maxJump **(Optional)** - Reject responses whose counter increases by more than this compared to the stored value. Unset by default (any forward progress is accepted)
+ * @param counterPolicy.legacyZero **(Optional)** - How to handle credentials whose stored counter is `0` when the response counter is also `0` (legacy credentials, or authenticators that never increment): `"allow"` (default) accepts them, `"reject"` refuses to authenticate them
  * @param advancedFIDOConfig **(Optional)** - Options for satisfying more stringent FIDO RP feature requirements
  * @param advancedFIDOConfig.userVerification **(Optional)** - Enable alternative rules for evaluating the User Presence and User Verified flags in authenticator data: UV (and UP) flags are optional unless this value is `"required"`
  */
@@ -49,6 +52,10 @@ export async function verifyAuthenticationResponse(
     expectedType?: string | string[];
     expectedTopOrigin?: string | string[];
     requireUserVerification?: boolean;
+    counterPolicy?: {
+      maxJump?: number;
+      legacyZero?: 'allow' | 'reject';
+    };
     advancedFIDOConfig?: {
       userVerification?: UserVerificationRequirement;
     };
@@ -63,6 +70,7 @@ export async function verifyAuthenticationResponse(
     expectedTopOrigin,
     credential,
     requireUserVerification = true,
+    counterPolicy,
     advancedFIDOConfig,
   } = options;
   const { id, rawId, type: credentialType, response: assertionResponse } = response;
@@ -264,16 +272,37 @@ export async function verifyAuthenticationResponse(
 
   const signature = isoBase64URL.toBuffer(assertionResponse.signature);
 
-  if (
-    (counter > 0 || credential.counter > 0) &&
-    counter <= credential.counter
-  ) {
+  const { maxJump: maxCounterJump, legacyZero: legacyZeroCounter = 'allow' } =
+    counterPolicy ?? {};
+
+  if (counter === 0 && credential.counter === 0) {
+    /**
+     * Both sides report a counter of 0, so there's nothing to compare. This is typical of
+     * legacy credentials registered before counters were tracked, and of authenticators that
+     * never increment their counter. RPs that require counter validation can reject these
+     * via `counterPolicy.legacyZero`.
+     */
+    if (legacyZeroCounter === 'reject') {
+      throw new Error(
+        'Response counter value 0 was rejected because this credential has never reported a counter',
+      );
+    }
+  } else if (counter <= credential.counter) {
     // Error out when the counter in the DB is greater than or equal to the counter in the
     // dataStruct. It's related to how the authenticator maintains the number of times its been
     // used for this client. If this happens, then someone's somehow increased the counter
     // on the device without going through this site
     throw new Error(
       `Response counter value ${counter} was lower than expected ${credential.counter}`,
+    );
+  } else if (
+    maxCounterJump !== undefined &&
+    counter - credential.counter > maxCounterJump
+  ) {
+    // A counter that jumps forward by more than the RP allows may indicate a cloned
+    // authenticator, so reject it rather than accept and persist the inflated value
+    throw new Error(
+      `Response counter value ${counter} jumped more than the allowed ${maxCounterJump} from ${credential.counter}`,
     );
   }
 
@@ -290,12 +319,23 @@ export async function verifyAuthenticationResponse(
 
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
 
-  const toReturn: VerifiedAuthenticationResponse = {
-    verified: await verifySignature({
-      signature,
-      data: signatureBase,
-      credentialPublicKey: credential.publicKey,
-    }),
+  const verified = await verifySignature({
+    signature,
+    data: signatureBase,
+    credentialPublicKey: credential.publicKey,
+  });
+
+  if (!verified) {
+    /**
+     * Failed verifications return no `authenticationInfo`, so there's no `newCounter` for
+     * callers to accidentally persist. External state (e.g. the stored counter) must remain
+     * untouched.
+     */
+    return { verified };
+  }
+
+  return {
+    verified,
     authenticationInfo: {
       newCounter: counter,
       credentialID: credential.id,
@@ -307,14 +347,15 @@ export async function verifyAuthenticationResponse(
       rpID: matchedRPID,
     },
   };
-
-  return toReturn;
 }
 
 /**
  * Result of authentication verification
  *
  * @param verified If the authentication response could be verified
+ * @param authenticationInfo Information about the authentication. **Only present when
+ * `verified` is `true`** — failed verifications return nothing to persist so that external
+ * state (e.g. the stored counter) is never changed by a failed attempt
  * @param authenticationInfo.credentialID The ID of the authenticator used during authentication.
  * Should be used to identify which DB authenticator entry needs its `counter` updated to the value
  * below
@@ -333,7 +374,7 @@ export async function verifyAuthenticationResponse(
  */
 export type VerifiedAuthenticationResponse = {
   verified: boolean;
-  authenticationInfo: {
+  authenticationInfo?: {
     credentialID: Base64URLString;
     newCounter: number;
     userVerified: boolean;

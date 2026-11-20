@@ -18,6 +18,7 @@ import {
 } from '../helpers/parseAuthenticatorData.ts';
 import { toHash } from '../helpers/toHash.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
+import { _verifySignatureInternals } from '../helpers/verifySignature.ts';
 import { denoSupportsPQC } from '../helpers/tests/index.ts';
 import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
 
@@ -44,9 +45,9 @@ Deno.test('should return authenticator info after verification', async () => {
     requireUserVerification: false,
   });
 
-  assertEquals(verification.authenticationInfo.newCounter, 144);
+  assertEquals(verification.authenticationInfo!.newCounter, 144);
   assertEquals(
-    verification.authenticationInfo.credentialID,
+    verification.authenticationInfo!.credentialID,
     credential.id,
   );
   assertEquals(verification.authenticationInfo?.origin, assertionOrigin);
@@ -206,6 +207,80 @@ Deno.test('should not compare counters if both are 0', async () => {
   });
 
   assertEquals(verification.verified, true);
+});
+
+Deno.test('should return no authenticationInfo when signature verification fails', async () => {
+  const mockVerifySignature = stub(
+    _verifySignatureInternals,
+    'stubThis',
+    returnsNext([Promise.resolve(false)]),
+  );
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+  });
+
+  mockVerifySignature.restore();
+
+  assertEquals(verification.verified, false);
+  // Failed verifications must not expose a counter to persist
+  assertEquals(verification.authenticationInfo, undefined);
+});
+
+Deno.test('should throw when counter jumps more than counterPolicy.maxJump allows', async () => {
+  await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        // `assertionResponse` has a counter of 144, a jump of 44 over the stored 100
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, counter: 100 },
+        requireUserVerification: false,
+        counterPolicy: { maxJump: 10 },
+      }),
+    Error,
+    'jumped more than the allowed 10',
+  );
+});
+
+Deno.test('should verify when counter jump is within counterPolicy.maxJump', async () => {
+  const verification = await verifyAuthenticationResponse({
+    // `assertionResponse` has a counter of 144, one more than the stored 143
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+    counterPolicy: { maxJump: 1 },
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo!.newCounter, 144);
+});
+
+Deno.test('should reject zero counters when counterPolicy.legacyZero is "reject"', async () => {
+  await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionFirstTimeUsedResponse,
+        expectedChallenge: assertionFirstTimeUsedChallenge,
+        expectedOrigin: assertionFirstTimeUsedOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: authenticatorFirstTimeUsed,
+        requireUserVerification: false,
+        counterPolicy: { legacyZero: 'reject' },
+      }),
+    Error,
+    'never reported a counter',
+  );
 });
 
 Deno.test('should throw an error if user verification is required but user was not verified', async () => {
