@@ -1,4 +1,4 @@
-import { assertEquals, assertNotEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertNotEquals, assertRejects } from '@std/assert';
 import { afterEach, beforeEach, describe, it } from '@std/testing/bdd';
 import {
   assertSpyCallArg,
@@ -17,8 +17,10 @@ import { generateLeafCert, generateRootCert } from '../helpers/tests/x509Utils.t
 
 import { BaseMetadataService, MetadataService } from './metadataService.ts';
 import { SettingsService } from './settingsService.ts';
-import type { MetadataStatement } from '../metadata/mdsTypes.ts';
+import type { AuthenticatorStatus, MetadataStatement, StatusReport } from '../metadata/mdsTypes.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
+import { NonRefreshingURL } from './helpers/mdsCache.ts';
 
 let mockFetch: Stub;
 
@@ -103,6 +105,128 @@ describe('Method: getStatement()', () => {
     const statement = await MetadataService.getStatement('not-a-real-aaguid');
 
     assertEquals(statement, undefined);
+  });
+
+  describe('MDS status report policy', () => {
+    /**
+     * A service that lets tests inject entries with arbitrary status reports without needing to
+     * download and verify a signed MDS BLOB
+     */
+    class TestableMetadataService extends BaseMetadataService {
+      cacheEntry(aaguid: string, statusReports: StatusReport[]): void {
+        this.metadataCache.cacheMetadata(
+          aaguid,
+          {
+            aaguid,
+            metadataStatement: { ...localStatement, aaguid },
+            statusReports,
+            timeOfLastStatusChange: '1970-01-01',
+          },
+          NonRefreshingURL,
+        );
+      }
+    }
+
+    const highRiskStatuses: AuthenticatorStatus[] = [
+      'REVOKED',
+      'USER_VERIFICATION_BYPASS',
+      'ATTESTATION_KEY_COMPROMISE',
+      'USER_KEY_REMOTE_COMPROMISE',
+      'USER_KEY_PHYSICAL_COMPROMISE',
+    ];
+
+    for (const status of highRiskStatuses) {
+      it(`should block registration with a typed error for high-risk status "${status}"`, async () => {
+        const service = new TestableMetadataService();
+        await service.initialize({
+          mdsServers: [],
+          statements: [],
+          verificationMode: 'strict',
+        });
+        const aaguid = `00000000-0000-0000-0000-0000000000${highRiskStatuses.indexOf(status) + 1}`;
+        service.cacheEntry(aaguid, [{ status, effectiveDate: '2024-01-01' }]);
+
+        const error = await assertRejects(
+          () => service.getStatement(aaguid),
+          SimpleWebAuthnError,
+        );
+
+        assertEquals(error.code, 'METADATA_HIGH_RISK_STATUS');
+        assert(error.message.includes(status), `error did not mention status "${status}"`);
+      });
+    }
+
+    it('should still return the statement for a FIDO-certified authenticator', async () => {
+      const service = new TestableMetadataService();
+      await service.initialize({ mdsServers: [], statements: [] });
+      const aaguid = '00000000-0000-0000-0000-0000000000a1';
+      service.cacheEntry(aaguid, [{ status: 'FIDO_CERTIFIED' }]);
+
+      const statement = await service.getStatement(aaguid);
+
+      assertEquals(statement?.aaguid, aaguid);
+    });
+
+    it('should preserve and record an unknown status instead of blocking', async () => {
+      const service = new TestableMetadataService();
+      const warnSpy = spy();
+      await service.initialize({
+        mdsServers: [],
+        statements: [],
+        logger: { warn: warnSpy },
+      });
+      const aaguid = '00000000-0000-0000-0000-0000000000a2';
+      service.cacheEntry(aaguid, [{ status: 'NOT_FIDO_CERTIFIED' }]);
+
+      const statement = await service.getStatement(aaguid);
+
+      assertEquals(statement?.aaguid, aaguid);
+      assertSpyCalls(warnSpy, 1);
+      const loggedMessage = warnSpy.calls[0].args[0] as string;
+      assert(
+        loggedMessage.includes('NOT_FIDO_CERTIFIED'),
+        `expected warning to mention NOT_FIDO_CERTIFIED, got: ${loggedMessage}`,
+      );
+    });
+
+    it('should throw a typed error for an unknown AAGUID in strict verification mode', async () => {
+      const service = new TestableMetadataService();
+      await service.initialize({
+        mdsServers: [],
+        statements: [],
+        verificationMode: 'strict',
+      });
+      const aaguid = '00000000-0000-0000-0000-0000000000a3';
+
+      const error = await assertRejects(
+        () => service.getStatement(aaguid),
+        SimpleWebAuthnError,
+      );
+
+      assertEquals(error.code, 'METADATA_AAGUID_UNKNOWN');
+    });
+
+    it('should explicitly record an unknown AAGUID in permissive verification mode', async () => {
+      const warnSpy = spy();
+      const service = new TestableMetadataService();
+      await service.initialize({
+        mdsServers: [],
+        statements: [],
+        verificationMode: 'permissive',
+        logger: { warn: warnSpy },
+      });
+      const aaguid = '00000000-0000-0000-0000-0000000000a4';
+
+      const statement = await service.getStatement(aaguid);
+
+      assertEquals(statement, undefined);
+      assertSpyCalls(warnSpy, 1);
+      const loggedMessage = warnSpy.calls[0].args[0] as string;
+      assert(
+        loggedMessage.includes(aaguid),
+        `expected warning to mention aaguid, got: ${loggedMessage}`,
+      );
+    });
   });
 });
 
@@ -766,8 +890,15 @@ async function generateBLOBResponse(opts: {
   nextUpdate: string;
   statement?: MetadataStatement;
   statements?: MetadataStatement[];
+  statusReports?: StatusReport[];
 }): Promise<Response> {
-  const { no, nextUpdate, statement, statements = statement ? [statement] : [] } = opts;
+  const {
+    no,
+    nextUpdate,
+    statement,
+    statements = statement ? [statement] : [],
+    statusReports = [],
+  } = opts;
 
   const { leafCertBase64, leafKeys } = await getBLOBSigner();
 
@@ -783,7 +914,7 @@ async function generateBLOBResponse(opts: {
     entries: statements.map((entryStatement) => ({
       aaguid: entryStatement.aaguid,
       metadataStatement: entryStatement,
-      statusReports: [],
+      statusReports,
       timeOfLastStatusChange: '1970-01-01',
     })),
   }));

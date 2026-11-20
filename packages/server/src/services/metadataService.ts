@@ -1,9 +1,11 @@
 import { convertAAGUIDToString } from '../helpers/convertAAGUIDToString.ts';
 import type { MetadataBLOBPayloadEntry, MetadataStatement } from '../metadata/mdsTypes.ts';
 import { verifyMDSBlob } from '../metadata/verifyMDSBlob.ts';
+import { assertNoHighRiskMDSStatus } from '../metadata/mdsStatusPolicy.ts';
 import type { SimpleWebAuthnLogger } from '../helpers/logging.ts';
 import type { Uint8Array_ } from '../types/index.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
 import { SERVICE_STATE } from './helpers/serviceStateTracker.ts';
 import { NonRefreshingURL } from './helpers/mdsCache.ts';
 import { BaseMDSService } from './helpers/baseMDSService.ts';
@@ -142,24 +144,34 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
     if (!entry) {
       if (this.verificationMode === 'strict') {
         // FIDO conformance requires RP's to only support registered AAGUID's
-        throw new Error(`No metadata statement found for aaguid "${aaguid}"`);
+        throw new SimpleWebAuthnError({
+          message: `No metadata statement found for aaguid "${aaguid}"`,
+          code: 'METADATA_AAGUID_UNKNOWN',
+        });
       }
 
-      // Allow registration verification to continue without using metadata
+      // Explicit permissive policy: allow registration verification to continue without using
+      // metadata, but record the unregistered AAGUID instead of silently ignoring it
+      this.logger.warn(
+        `No metadata statement found for aaguid "${aaguid}"; continuing because ` +
+          'MetadataService verificationMode is "permissive"',
+      );
       return;
     }
 
-    // Check to see if the this aaguid has a status report with a "compromised" status
-    for (const report of entry.statusReports) {
-      const { status } = report;
-      if (
-        status === 'USER_VERIFICATION_BYPASS' ||
-        status === 'ATTESTATION_KEY_COMPROMISE' ||
-        status === 'USER_KEY_REMOTE_COMPROMISE' ||
-        status === 'USER_KEY_PHYSICAL_COMPROMISE'
-      ) {
-        throw new Error(`Detected compromised aaguid "${aaguid}"`);
-      }
+    // Evaluate the entry's status reports against the MDS status policy. High-risk statuses
+    // (compromise reports and REVOKED) throw and block registration; unknown/untrusted statuses
+    // are recorded and registration continues.
+    const statusPolicy = assertNoHighRiskMDSStatus(aaguid, entry.statusReports);
+
+    if (statusPolicy.hasUntrustedStatus) {
+      const statusSummary = statusPolicy.observedStatuses.length > 0
+        ? `observed statuses: ${JSON.stringify(statusPolicy.observedStatuses)}`
+        : 'the entry contains no status reports';
+      this.logger.warn(
+        `Metadata for aaguid "${aaguid}" has no trusted (FIDO-certified) status (${statusSummary}); ` +
+          'allowing registration to continue',
+      );
     }
 
     return entry.metadataStatement;

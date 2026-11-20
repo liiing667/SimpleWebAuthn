@@ -3,6 +3,7 @@ import type { AlgSign, MetadataStatement } from '../metadata/mdsTypes.ts';
 import { convertCertBufferToPEM } from '../helpers/convertCertBufferToPEM.ts';
 import { validateCertificatePath } from '../helpers/validateCertificatePath.ts';
 import { decodeCredentialPublicKey } from '../helpers/decodeCredentialPublicKey.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
 import {
   type COSEALG,
   type COSECRV,
@@ -160,6 +161,19 @@ export async function verifyAttestationWithMetadata({
     statementRootCerts.indexOf(authenticatorCerts[0]) >= 0
   ) {
     authenticatorIsSelfReferencing = true;
+  }
+
+  if (!authenticatorIsSelfReferencing && statementRootCerts.length === 0) {
+    /**
+     * Fail closed: without any attestation root certificates in the metadata statement there is
+     * nothing to chain the x5c to, so the attestation cannot be authenticated. Allowing this to
+     * continue would silently bypass attestation certificate validation.
+     */
+    throw new SimpleWebAuthnError({
+      message: 'Metadata statement contained no attestation root certificates against which to ' +
+        'verify the x5c certificate chain',
+      code: 'METADATA_ATTESTATION_ROOT_CERT_MISSING',
+    });
   }
 
   if (!authenticatorIsSelfReferencing) {
