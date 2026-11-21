@@ -3,6 +3,7 @@ import type {
   AuthenticatorSelectionCriteria,
   Base64URLString,
   PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialDescriptorJSON,
   PublicKeyCredentialHint,
   PublicKeyCredentialParameters,
   Uint8Array_,
@@ -12,6 +13,7 @@ import { generateChallenge } from '../helpers/generateChallenge.ts';
 import { generateUserID } from '../helpers/generateUserID.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { COSEALG } from '../helpers/cose.ts';
+import { RegistrationChallengeService } from '../services/registrationChallengeService.ts';
 
 export type GenerateRegistrationOptionsOpts = Parameters<typeof generateRegistrationOptions>[0];
 
@@ -161,6 +163,17 @@ export async function generateRegistrationOptions(
     _userID = await generateUserID();
   }
 
+  const challengeString = isoBase64URL.fromBuffer(_challenge);
+  const _userIDString = isoBase64URL.fromBuffer(_userID);
+  /**
+   * Group credentials by the RP's stable user ID when one is supplied. When options only get a
+   * library-generated random user ID, fall back to the RP ID + username so a retry for the same
+   * account can still inherit `excludeCredentials` from a registration that hasn't been saved.
+   */
+  const trackingKey = userID !== undefined
+    ? `user:${_userIDString}`
+    : `name:${rpID}\u0000${userName}`;
+
   /**
    * Map authenticator preference to hints. Map to authenticatorAttachment as well for
    * backwards-compatibility.
@@ -179,21 +192,8 @@ export async function generateRegistrationOptions(
     }
   }
 
-  return {
-    challenge: isoBase64URL.fromBuffer(_challenge),
-    rp: {
-      name: rpName,
-      id: rpID,
-    },
-    user: {
-      id: isoBase64URL.fromBuffer(_userID),
-      name: userName,
-      displayName: userDisplayName,
-    },
-    pubKeyCredParams,
-    timeout,
-    attestation: attestationType,
-    excludeCredentials: excludeCredentials.map((cred) => {
+  const excludeCredentialDescriptors: PublicKeyCredentialDescriptorJSON[] = excludeCredentials.map(
+    (cred) => {
       if (!isoBase64URL.isBase64URL(cred.id)) {
         throw new Error(`excludeCredential id "${cred.id}" is not a valid base64url string`);
       }
@@ -203,7 +203,55 @@ export async function generateRegistrationOptions(
         id: isoBase64URL.trimPadding(cred.id),
         type: 'public-key',
       };
-    }),
+    },
+  );
+
+  /**
+   * If this user already completed a registration that hasn't made it into the RP's database yet
+   * (for example because saving timed out), keep that credential in `excludeCredentials` so a
+   * retry can't convince the authenticator to mint a second credential.
+   */
+  for (const credential of RegistrationChallengeService.getCredentialsForUser(trackingKey)) {
+    if (!excludeCredentialDescriptors.some((cred) => cred.id === credential.credentialID)) {
+      const descriptor: PublicKeyCredentialDescriptorJSON = {
+        id: credential.credentialID,
+        type: 'public-key',
+      };
+      if (credential.transports) {
+        descriptor.transports = credential.transports;
+      }
+      excludeCredentialDescriptors.push(descriptor);
+    }
+  }
+
+  /**
+   * Remember this challenge so `verifyRegistrationResponse()` can consume it exactly once. This
+   * closes the gap where a client retries a timed-out registration (or replays a captured `none`
+   * attestation) with the same challenge.
+   */
+  RegistrationChallengeService.rememberChallenge({
+    challenge: challengeString,
+    userID: _userIDString,
+    trackingKey,
+    userIDWasProvided: userID !== undefined,
+    timeoutMS: timeout,
+  });
+
+  return {
+    challenge: challengeString,
+    rp: {
+      name: rpName,
+      id: rpID,
+    },
+    user: {
+      id: _userIDString,
+      name: userName,
+      displayName: userDisplayName,
+    },
+    pubKeyCredParams,
+    timeout,
+    attestation: attestationType,
+    excludeCredentials: excludeCredentialDescriptors,
     authenticatorSelection,
     extensions: {
       ...extensions,

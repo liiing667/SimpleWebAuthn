@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** Registration challenges issued by `generateRegistrationOptions()` and credential IDs
+  accepted by `verifyRegistrationResponse()` are now consumed exactly once. A retry after a
+  timed-out save, a concurrent replay of the same response, or a captured assertion-less (`"none"`)
+  attestation replayed into another account can no longer produce a second credential.
+  `verifyRegistrationResponse()` accepts an optional `expectedUserID` argument for explicitly
+  binding a response to the user the challenge was generated for
+
 ## v14.1.0
 
 **Changes:**
