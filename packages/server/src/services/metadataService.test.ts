@@ -639,6 +639,127 @@ describe('Behavior: BLOB refresh', () => {
   });
 });
 
+describe('Behavior: cache generation consistency', () => {
+  const mdsServerURL = 'https://mds.example.com/';
+  let mockFetch: Stub;
+  let originalMDSRootCerts: string[];
+  const refreshableAAGUID = '00000000-0000-0000-0000-000000000001';
+
+  beforeEach(async () => {
+    const { rootCertPEM } = await getBLOBSigner();
+    originalMDSRootCerts = SettingsService.getRootCertificates({ identifier: 'mds' });
+    SettingsService.setRootCertificates({ identifier: 'mds', certificates: [rootCertPEM] });
+  });
+
+  afterEach(() => {
+    SettingsService.setRootCertificates({
+      identifier: 'mds',
+      certificates: originalMDSRootCerts,
+    });
+    mockFetch.restore();
+  });
+
+  it('should not let a refresh from before a re-initialization write into the new cache', async () => {
+    const staleStatement: MetadataStatement = {
+      ...localStatement,
+      aaguid: refreshableAAGUID,
+      description: 'Statement from the stale BLOB',
+    };
+    const freshStatement: MetadataStatement = {
+      ...localStatement,
+      aaguid: refreshableAAGUID,
+      description: 'Statement from the BLOB after restart',
+    };
+
+    // The first BLOB is already stale so the first lookup kicks off a refresh. That refresh is
+    // delayed past the re-initialization, simulating a restart mid-refresh
+    mockFetch = stub(
+      _fetchInternals,
+      'stubThis',
+      returnsNext([
+        generateBLOBResponse({ no: 1, nextUpdate: '2023-01-01', statement: staleStatement }),
+        new Promise<Response>((resolve) =>
+          setTimeout(
+            () =>
+              resolve(
+                generateBLOBResponse({
+                  no: 2,
+                  nextUpdate: '2999-01-01',
+                  statement: freshStatement,
+                }),
+              ),
+            50,
+          )
+        ),
+        // The BLOB downloaded by the re-initialization after the "restart"
+        generateBLOBResponse({ no: 3, nextUpdate: '2999-01-01', statement: freshStatement }),
+      ]),
+    );
+
+    await MetadataService.initialize({ mdsServers: [mdsServerURL] });
+
+    // Start the stale refresh but don't wait for it, then re-initialize before it resolves
+    const inFlightLookup = MetadataService.getStatement(refreshableAAGUID);
+
+    await MetadataService.initialize({ mdsServers: [mdsServerURL] });
+    assertSpyCalls(mockFetch, 2);
+
+    // The lookup that straddled the re-initialization must fail instead of mixing generations
+    await assertRejects(
+      () => inFlightLookup,
+      Error,
+      're-initialized',
+    );
+
+    // Let the in-flight (now stale) refresh resolve
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    // The new generation's cache is untouched: no extra fetch happened and the fresh statement
+    // is what's served, so a BLOB that revoked an authenticator can't be overwritten by stale
+    // data after a restart
+    assertSpyCalls(mockFetch, 2);
+    assertEquals(await MetadataService.getStatement(refreshableAAGUID), freshStatement);
+  });
+
+  it('should keep serving the fresh generation after a restart even if the old refresh fails', async () => {
+    const staleStatement: MetadataStatement = {
+      ...localStatement,
+      aaguid: refreshableAAGUID,
+      description: 'Statement from the stale BLOB',
+    };
+    const freshStatement: MetadataStatement = {
+      ...localStatement,
+      aaguid: refreshableAAGUID,
+      description: 'Statement from the BLOB after restart',
+    };
+
+    mockFetch = stub(
+      _fetchInternals,
+      'stubThis',
+      returnsNext([
+        generateBLOBResponse({ no: 1, nextUpdate: '2023-01-01', statement: staleStatement }),
+        new Promise<Response>((_resolve, reject) =>
+          setTimeout(() => reject(new Error('Network down')), 50)
+        ),
+        generateBLOBResponse({ no: 2, nextUpdate: '2999-01-01', statement: freshStatement }),
+      ]),
+    );
+
+    await MetadataService.initialize({ mdsServers: [mdsServerURL] });
+
+    const inFlightLookup = MetadataService.getStatement(refreshableAAGUID);
+    await MetadataService.initialize({ mdsServers: [mdsServerURL] });
+
+    await assertRejects(() => inFlightLookup, Error, 're-initialized');
+
+    // Wait for the failed stale refresh to settle
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    // The fresh generation stays READY and serves its own statement
+    assertEquals(await MetadataService.getStatement(refreshableAAGUID), freshStatement);
+  });
+});
+
 describe('Behavior: logging', () => {
   it('should use provided logger', async () => {
     const _debugSpy = spy();

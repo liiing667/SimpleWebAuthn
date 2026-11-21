@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** `MetadataService` and `ConvenienceMetadataService` now track a "generation" of
+  cached metadata. MDS BLOB refreshes that are still in flight when the service is re-initialized
+  (for example after a restart) can no longer write stale BLOB data into the fresh cache or flip
+  service state underneath it, so authenticators revoked by the current BLOB stay untrusted during
+  registration verification. Lookups that straddle a re-initialization fail with a clear error
+  instead of observing mixed cache generations
+
 ## v14.1.0
 
 **Changes:**

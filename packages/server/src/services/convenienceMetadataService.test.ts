@@ -1,4 +1,4 @@
-import { assertEquals } from '@std/assert';
+import { assertEquals, assertRejects } from '@std/assert';
 import { afterEach, beforeEach, describe, it } from '@std/testing/bdd';
 import {
   assertSpyCallArg,
@@ -517,6 +517,56 @@ describe('Behavior: refreshing stale metadata', () => {
         assertSpyCalls(errorSpy, 0);
       });
     });
+  });
+});
+
+describe('Behavior: cache generation consistency', () => {
+  it('should not let a refresh from before a re-initialization write into the new cache', async () => {
+    /**
+     * Expose the protected refresh-scheduling helpers so a server can be made stale without
+     * faking time (the in-flight refresh below relies on real timers)
+     */
+    class TestableConvenienceMetadataService extends BaseConvenienceMetadataService {
+      makeServerStale(url: string): void {
+        this.delayNextRefresh(url, -(24 * 8));
+      }
+    }
+
+    const staleService = new TestableConvenienceMetadataService();
+
+    const freshMetadata: ProviderMetadata = { friendlyNames: { en: 'After restart' } };
+
+    stubFetch(
+      // Initial payload, already stale (the service refreshes 24h after a successful download)
+      Promise.resolve(Response.json({ no: 1, [serverAAGUID]: originalMetadata })),
+      // A slow refresh that stays in flight across the re-initialization
+      new Promise<Response>((resolve) =>
+        setTimeout(
+          () => resolve(Response.json({ no: 2, [serverAAGUID]: updatedMetadata })),
+          50,
+        )
+      ),
+      // The payload downloaded by the re-initialization after the "restart"
+      Promise.resolve(Response.json({ no: 3, [serverAAGUID]: freshMetadata })),
+    );
+
+    await staleService.initialize({ mdsServers: [cmdsURL] });
+    staleService.makeServerStale(cmdsURL);
+
+    // Start the slow refresh, then re-initialize before it resolves
+    const inFlightLookup = staleService.getProviderMetadata(serverAAGUID);
+    await staleService.initialize({ mdsServers: [cmdsURL] });
+    assertSpyCalls(mockFetch, 2);
+
+    // The lookup that straddled the re-initialization must fail instead of mixing generations
+    await assertRejects(() => inFlightLookup, Error, 're-initialized');
+
+    // Let the in-flight (now stale) refresh settle
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    // The new generation's cache is untouched: no extra fetch and its own metadata is served
+    assertSpyCalls(mockFetch, 2);
+    assertEquals(await staleService.getProviderMetadata(serverAAGUID), freshMetadata);
   });
 });
 

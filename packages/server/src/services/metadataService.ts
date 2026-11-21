@@ -129,12 +129,40 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
       aaguid = convertAAGUIDToString(aaguid);
     }
 
+    // Remember which generation of cached data this lookup started against. If the service gets
+    // re-initialized (e.g. after a restart) while a refresh is in flight then the lookup must not
+    // be answered using data from the replacement generation, so that revocation status and
+    // registration verification stay consistent with the BLOB the lookup began under
+    const generation = this.currentGeneration;
+
     // If a cache refresh is in progress then pause this until the service is ready
     await this.state.pauseUntilReady();
 
     // Refresh any servers whose BLOBs are stale, whether or not this AAGUID is cached. This lets
     // lookups of newly-registered AAGUIDs discover them
-    await this.refreshStaleServers();
+    try {
+      await this.refreshStaleServers();
+    } catch (err) {
+      // A re-initialization (e.g. after a restart) takes precedence: report that instead of a
+      // refresh error from the dead generation, and never answer with the new generation's cache
+      if (!this.generationIsCurrent(generation)) {
+        throw new Error(
+          `MetadataService was re-initialized while looking up aaguid "${aaguid}", ` +
+            'please retry the registration',
+        );
+      }
+      throw err;
+    }
+
+    // A re-initialization replaced the generation this lookup started in; its answer is no
+    // longer well-defined against the current cache, so fail the lookup instead of silently
+    // mixing generations (which could make a revoked authenticator look trusted)
+    if (!this.generationIsCurrent(generation)) {
+      throw new Error(
+        `MetadataService was re-initialized while looking up aaguid "${aaguid}", ` +
+          'please retry the registration',
+      );
+    }
 
     // Try to grab a cached statement
     const entry = this.metadataCache.getMetadata(aaguid);
@@ -195,14 +223,25 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
    * Download the latest BLOB from MDS, verify it, and cache its entries
    */
   protected async downloadAndCache(url: string, no: number): Promise<number | undefined> {
+    // A re-initialization (e.g. after a restart) may have started while this download was being
+    // scheduled. Don't fetch, verify, or cache anything for a generation that's no longer current
+    // so that stale BLOB data can never overwrite the fresh generation's cache and make a revoked
+    // authenticator look trusted again
+    const generation = this.currentGeneration;
+
     const resp = await this.fetchFromServer(url, no);
-    if (!resp) {
+    if (!resp || !this.generationIsCurrent(generation)) {
       return;
     }
 
     // "BLOB" is FIDO's terminology, not mine
     const blob = await resp.text();
-    return this.verifyBlob(blob, url, no);
+
+    if (!this.generationIsCurrent(generation)) {
+      return;
+    }
+
+    return this.verifyBlob(blob, url, no, generation);
   }
 
   /**
@@ -220,8 +259,23 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
    *
    * Returns the number of FIDO2 metadata statements that were cached.
    */
-  private async verifyBlob(blob: string, url: string, no: number): Promise<number> {
+  private async verifyBlob(
+    blob: string,
+    url: string,
+    no: number,
+    generation: number,
+  ): Promise<number> {
     const { payload, parsedNextUpdate } = await verifyMDSBlob(blob);
+
+    // Verification involves awaits (JWT signature checks etc.); a re-initialization (e.g. after
+    // a restart) may have replaced the generation that started this download. Abort before
+    // mutating the cache so stale BLOB data can't evict or overwrite the fresh generation's
+    // entries and make a revoked authenticator look trusted
+    if (!this.generationIsCurrent(generation)) {
+      throw new Error(
+        'MetadataService was re-initialized while an MDS BLOB was being verified',
+      );
+    }
 
     if (payload.no <= no) {
       // From FIDO MDS docs: "also ignore the file if its number (no) is less or equal to the

@@ -76,12 +76,21 @@ export class BaseConvenienceMetadataService extends BaseMDSService<ProviderMetad
    * Download the convenience metadata, which is surprisingly just a JSON document, and cache it
    */
   protected async downloadAndCache(url: string, no: number): Promise<number | undefined> {
+    // See BaseMetadataService.downloadAndCache(): ignore results that belong to a generation
+    // that's been superseded by a re-initialization (e.g. after a restart)
+    const generation = this.currentGeneration;
+
     const resp = await this.fetchFromServer(url, no);
-    if (!resp) {
+    if (!resp || !this.generationIsCurrent(generation)) {
       return;
     }
 
     const payload: ConvenienceMDSPayload = await resp.json();
+
+    if (!this.generationIsCurrent(generation)) {
+      return;
+    }
+
     return this.cacheConvenienceMDS(url, payload);
   }
 
@@ -135,12 +144,34 @@ export class BaseConvenienceMetadataService extends BaseMDSService<ProviderMetad
       return;
     }
 
+    // See BaseMetadataService.getStatement(): track the generation this lookup starts under so
+    // a re-initialization (e.g. after a restart) can't let the lookup observe a mix of cache
+    // generations
+    const generation = this.currentGeneration;
+
     // If a cache refresh is in progress then pause this until the service is ready
     await this.state.pauseUntilReady();
 
     // Refresh any servers whose data is stale, whether or not this AAGUID is cached. This lets
     // lookups of newly-registered AAGUIDs discover them
-    await this.refreshStaleServers();
+    try {
+      await this.refreshStaleServers();
+    } catch (err) {
+      if (!this.generationIsCurrent(generation)) {
+        throw new Error(
+          `ConvenienceMetadataService was re-initialized while looking up aaguid ` +
+            `"${aaguid}", please try again`,
+        );
+      }
+      throw err;
+    }
+
+    if (!this.generationIsCurrent(generation)) {
+      throw new Error(
+        `ConvenienceMetadataService was re-initialized while looking up aaguid ` +
+          `"${aaguid}", please try again`,
+      );
+    }
 
     const cachedMetadata = this.metadataCache.getMetadata(aaguid);
 

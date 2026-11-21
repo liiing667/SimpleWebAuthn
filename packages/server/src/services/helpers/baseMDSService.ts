@@ -18,6 +18,15 @@ export abstract class BaseMDSService<MDSDataType> {
   protected state: ServiceStateTracker;
   protected logger: Required<SimpleWebAuthnLogger> = DefaultNoopLogger;
 
+  /**
+   * A monotonically increasing identifier for the current "generation" of cached data. It's
+   * bumped every time `initialize()` resets the cache so that asynchronous work (e.g. an MDS
+   * BLOB refresh that was in flight when the service was re-initialized, such as after a
+   * restart) can recognize that it's stale and avoid mutating the cache or flipping service
+   * state out from underneath the generation that replaced it.
+   */
+  private generation = 0;
+
   /** How many hours to wait to check a server again when it has nothing new to download */
   protected readonly defaultRefreshDelayHours = 24;
   /** How many hours to wait to retry a _failed_ attempt to refresh a server */
@@ -52,12 +61,34 @@ export abstract class BaseMDSService<MDSDataType> {
    * `initialize()`.
    */
   protected beginInitialize(logger: SimpleWebAuthnLogger = DefaultNoopLogger): void {
+    // Start a new generation before anything is reset so that refreshes from the previous
+    // generation (for example one still in flight when the service is re-initialized after a
+    // restart) become no-ops instead of writing into the fresh cache
+    this.generation += 1;
+
     this.metadataCache.reset();
     this.serverRefreshes = {};
 
     this.logger = buildLoggerAllMethods(logger);
     this.state = new ServiceStateTracker(this.serviceName, this.logger);
     this.state.set(SERVICE_STATE.REFRESHING);
+  }
+
+  /**
+   * The generation of cached data the service is currently on. Capture it at the start of an
+   * asynchronous operation and compare it against `this.generation` before touching the cache or
+   * service state, to make sure the operation hasn't been superseded by a re-initialization.
+   */
+  protected get currentGeneration(): number {
+    return this.generation;
+  }
+
+  /**
+   * Whether the provided generation is still the active one (i.e. the service hasn't been
+   * re-initialized since the generation was captured.)
+   */
+  protected generationIsCurrent(generation: number): boolean {
+    return generation === this.generation;
   }
 
   /**
@@ -113,6 +144,11 @@ export abstract class BaseMDSService<MDSDataType> {
    * See https://fidoalliance.org/specs/mds/fido-metadata-service-v3.1-ps-20250521.html#sctn-mds-blob-proc-rules
    */
   protected async fetchFromServer(url: string, no: number): Promise<Response | undefined> {
+    // Capture the generation so response handling below (which can delay the next refresh) can't
+    // mutate a newer generation's cache if a re-initialization happened while the request was
+    // in flight
+    const generation = this.generation;
+
     const _url = new URL(url);
     _url.searchParams.set('localCopySerial', String(no));
     const resp = await fetch(_url.toString(), {
@@ -126,7 +162,9 @@ export abstract class BaseMDSService<MDSDataType> {
         `The MDS server at "${_url.toString()}" reported nothing new to download (HTTP 304)`,
       );
       // There's nothing new to download, wait another interval before checking again
-      this.delayNextRefresh(url, this.defaultRefreshDelayHours);
+      if (this.generationIsCurrent(generation)) {
+        this.delayNextRefresh(url, this.defaultRefreshDelayHours);
+      }
       return;
     }
 
@@ -138,7 +176,9 @@ export abstract class BaseMDSService<MDSDataType> {
         `The MDS server at "${_url.toString()}" rate-limited this request (HTTP 429)`,
       );
       // We checked too soon, wait a bit before checking again
-      this.delayNextRefresh(url, this.defaultRetryDelayHours);
+      if (this.generationIsCurrent(generation)) {
+        this.delayNextRefresh(url, this.defaultRetryDelayHours);
+      }
       return;
     }
 
@@ -149,7 +189,9 @@ export abstract class BaseMDSService<MDSDataType> {
       );
       // Likely an HTTP 500 error, but anything not within HTTP 200-299. Wait a bit before trying
       // again
-      this.delayNextRefresh(url, this.defaultRetryDelayHours);
+      if (this.generationIsCurrent(generation)) {
+        this.delayNextRefresh(url, this.defaultRetryDelayHours);
+      }
       return;
     }
 
@@ -167,37 +209,71 @@ export abstract class BaseMDSService<MDSDataType> {
   }
 
   /**
+   * In-flight refreshes keyed by server URL. Reassigned on every `initialize()` so refreshes from
+   * a dead generation can never remove or observe refreshes belonging to the new generation
+   */
+  private serverRefreshes: { [url: string]: Promise<void> } = {};
+
+  /**
    * Refresh a single server, subscribing to the refresh already in flight if there is one.
    * Failures are passed to `handleRefreshFailure()`.
    */
-  private serverRefreshes: { [url: string]: Promise<void> } = {};
-  private refreshServer(url: string): Promise<void> {
-    const inFlight = this.serverRefreshes[url];
+  private async refreshServer(url: string): Promise<void> {
+    // Bind to the current generation's refresh map; a re-initialization swaps in a fresh map, so
+    // stale refreshes clean themselves up without touching the new generation's refreshes
+    const refreshes = this.serverRefreshes;
+    const inFlight = refreshes[url];
     if (inFlight) {
-      return inFlight;
+      await inFlight;
+      return;
     }
+
+    // Capture the generation so a re-initialization (e.g. after a restart) starting while this
+    // refresh is in flight can leave it a no-op, keeping the new generation's cache and state
+    // consistent
+    const generation = this.generation;
 
     this.state.set(SERVICE_STATE.REFRESHING);
 
-    const refresh = (async () => {
+    const refresh = (async (): Promise<void> => {
+      let refreshError: unknown;
+      let refreshFailed = false;
       try {
         const mdsNo = this.metadataCache.getMDSServerDataVersion(url);
         await this.downloadAndCache(url, mdsNo);
       } catch (err) {
         this.logger.error(`Could not download data from "${url}":`, err);
+
+        // A re-initialization superseded this refresh, so its failure belongs to a dead
+        // generation and must not be handled against (or delay a refresh within) the new one
+        if (!this.generationIsCurrent(generation)) {
+          return;
+        }
+
+        refreshFailed = true;
+        refreshError = err;
         this.handleRefreshFailure(url, err);
       } finally {
-        delete this.serverRefreshes[url];
-        // Only report ready once every refresh has finished
-        if (Object.keys(this.serverRefreshes).length === 0) {
+        delete refreshes[url];
+
+        // Only report ready once every refresh from this still-current generation has finished
+        if (
+          this.generationIsCurrent(generation) &&
+          Object.keys(refreshes).length === 0
+        ) {
           this.state.set(SERVICE_STATE.READY);
         }
       }
+
+      // `handleRefreshFailure()` may have rethrown, in which case preserve fail-closed behavior
+      if (refreshFailed) {
+        throw refreshError;
+      }
     })();
 
-    this.serverRefreshes[url] = refresh;
+    refreshes[url] = refresh;
 
-    return refresh;
+    await refresh;
   }
 
   /**
