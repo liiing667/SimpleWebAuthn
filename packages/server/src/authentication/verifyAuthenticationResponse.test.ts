@@ -18,6 +18,7 @@ import {
 } from '../helpers/parseAuthenticatorData.ts';
 import { toHash } from '../helpers/toHash.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
+import { _verifySignatureInternals } from '../helpers/verifySignature.ts';
 import { denoSupportsPQC } from '../helpers/tests/index.ts';
 import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
 
@@ -44,9 +45,9 @@ Deno.test('should return authenticator info after verification', async () => {
     requireUserVerification: false,
   });
 
-  assertEquals(verification.authenticationInfo.newCounter, 144);
+  assertEquals(verification.authenticationInfo!.newCounter, 144);
   assertEquals(
-    verification.authenticationInfo.credentialID,
+    verification.authenticationInfo!.credentialID,
     credential.id,
   );
   assertEquals(verification.authenticationInfo?.origin, assertionOrigin);
@@ -206,6 +207,96 @@ Deno.test('should not compare counters if both are 0', async () => {
   });
 
   assertEquals(verification.verified, true);
+});
+
+Deno.test('should verify a legacy credential first reporting a counter', async () => {
+  // `assertionResponse` has a counter of 144 while the stored counter is 0, as happens when a
+  // legacy credential's authenticator first reports a counter
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, counter: 0 },
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo!.newCounter, 144);
+});
+
+Deno.test('should freeze credential identity and counter when authentication starts', async () => {
+  // A credential object that gets mutated while verification is in flight, as happens when a
+  // concurrent login commits a newer counter to shared state
+  const mutableCredential: WebAuthnCredential = { ...credential };
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: (challenge) => {
+      // Simulate a concurrent login committing a newer counter, and the credential identity
+      // being overwritten, after verification has already started
+      mutableCredential.counter = 1000;
+      mutableCredential.id = 'mutatedMidVerification';
+      return challenge === assertionChallenge;
+    },
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: mutableCredential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  // The counter check used the frozen generation (143), so response counter 144 still verifies
+  assertEquals(verification.authenticationInfo!.newCounter, 144);
+  // The returned credential identity is the one frozen at authentication start
+  assertEquals(verification.authenticationInfo!.credentialID, credential.id);
+});
+
+Deno.test('should reject replayed counter if stored counter regresses mid-flight', async () => {
+  // Stored counter matches the response counter of 144, simulating a replayed assertion
+  const mutableCredential: WebAuthnCredential = { ...credential, counter: 144 };
+
+  await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: (challenge) => {
+          // A stale snapshot (e.g. loaded from storage after a restart) regresses the stored
+          // counter mid-verification; the frozen generation must still be enforced
+          mutableCredential.counter = 0;
+          return challenge === assertionChallenge;
+        },
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: mutableCredential,
+        requireUserVerification: false,
+      }),
+    Error,
+    'counter value',
+  );
+});
+
+Deno.test('should return no authenticationInfo when signature verification fails', async () => {
+  const mockVerifySignature = stub(
+    _verifySignatureInternals,
+    'stubThis',
+    returnsNext([Promise.resolve(false)]),
+  );
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+  });
+
+  mockVerifySignature.restore();
+
+  assertEquals(verification.verified, false);
+  // Failed verifications expose no counter to persist, so external state stays untouched
+  assertEquals(verification.authenticationInfo, undefined);
 });
 
 Deno.test('should throw an error if user verification is required but user was not verified', async () => {

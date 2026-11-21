@@ -34,6 +34,9 @@ export type VerifyAuthenticationResponseOpts = Parameters<typeof verifyAuthentic
  * @param expectedOrigin - Website URL (or array of URLs) that the registration should have occurred on
  * @param expectedRPID - RP ID (or array of IDs) that was specified in the registration options
  * @param credential - An internal {@link WebAuthnCredential} corresponding to `id` in the authentication response
+ * (its `id`, `publicKey`, and `counter` are snapshotted when verification starts, so mutating the
+ * object while verification is in flight — e.g. a concurrent login committing a newer counter, or a
+ * stale post-restart snapshot regressing it — cannot influence this verification)
  * @param expectedType **(Optional)** - The response type expected ('webauthn.get')
  * @param requireUserVerification **(Optional)** - Enforce user verification by the authenticator (via PIN, fingerprint, etc...) Defaults to `true`
  * @param advancedFIDOConfig **(Optional)** - Options for satisfying more stringent FIDO RP feature requirements
@@ -66,6 +69,20 @@ export async function verifyAuthenticationResponse(
     advancedFIDOConfig,
   } = options;
   const { id, rawId, type: credentialType, response: assertionResponse } = response;
+
+  /**
+   * Freeze the credential's identity and current counter generation before any async work begins.
+   * Verification spans multiple `await`s, during which the caller's credential object may be
+   * mutated — a concurrent login committing a newer counter, or a stale snapshot loaded after a
+   * restart regressing it. Snapshotting these values here keeps this verification consistent with
+   * the credential state observed at authentication start, so a replayed response can't be
+   * re-accepted against a regressed counter.
+   */
+  const {
+    id: credentialID,
+    publicKey: credentialPublicKey,
+    counter: currentCounter,
+  } = credential;
 
   // Ensure credential specified an ID
   if (!id) {
@@ -264,20 +281,24 @@ export async function verifyAuthenticationResponse(
 
   const signature = isoBase64URL.toBuffer(assertionResponse.signature);
 
-  if (
-    (counter > 0 || credential.counter > 0) &&
-    counter <= credential.counter
-  ) {
+  if (counter === 0 && currentCounter === 0) {
+    /**
+     * Both sides report a counter of 0, so there's nothing to compare. This is typical of
+     * authenticators that never increment their counter (e.g. synced multi-device credentials)
+     * and of legacy credentials registered before counters were tracked. Such credentials remain
+     * valid to authenticate with.
+     */
+  } else if (counter <= currentCounter) {
     // Error out when the counter in the DB is greater than or equal to the counter in the
     // dataStruct. It's related to how the authenticator maintains the number of times its been
     // used for this client. If this happens, then someone's somehow increased the counter
     // on the device without going through this site
     throw new Error(
-      `Response counter value ${counter} was lower than expected ${credential.counter}`,
+      `Response counter value ${counter} was lower than expected ${currentCounter}`,
     );
   }
 
-  const decodedPublicKey = decodeCredentialPublicKey(credential.publicKey);
+  const decodedPublicKey = decodeCredentialPublicKey(credentialPublicKey);
   const pubKeyAlg = decodedPublicKey.get(COSEKEYS.alg);
 
   if (typeof pubKeyAlg !== 'number') {
@@ -290,15 +311,26 @@ export async function verifyAuthenticationResponse(
 
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
 
-  const toReturn: VerifiedAuthenticationResponse = {
-    verified: await verifySignature({
-      signature,
-      data: signatureBase,
-      credentialPublicKey: credential.publicKey,
-    }),
+  const verified = await verifySignature({
+    signature,
+    data: signatureBase,
+    credentialPublicKey,
+  });
+
+  if (!verified) {
+    /**
+     * Failed verifications return no `authenticationInfo`, so there's no `newCounter` for
+     * callers to accidentally persist. External state (e.g. the stored counter) must remain
+     * untouched by a failed attempt, keeping the committed counter monotonic across retries.
+     */
+    return { verified };
+  }
+
+  return {
+    verified,
     authenticationInfo: {
       newCounter: counter,
-      credentialID: credential.id,
+      credentialID,
       userVerified: flags.uv,
       credentialDeviceType,
       credentialBackedUp,
@@ -307,14 +339,15 @@ export async function verifyAuthenticationResponse(
       rpID: matchedRPID,
     },
   };
-
-  return toReturn;
 }
 
 /**
  * Result of authentication verification
  *
  * @param verified If the authentication response could be verified
+ * @param authenticationInfo Information about the authentication. **Only present when
+ * `verified` is `true`** — failed verifications return nothing to persist so that external
+ * state (e.g. the stored counter) is never changed by a failed attempt
  * @param authenticationInfo.credentialID The ID of the authenticator used during authentication.
  * Should be used to identify which DB authenticator entry needs its `counter` updated to the value
  * below
@@ -333,7 +366,7 @@ export async function verifyAuthenticationResponse(
  */
 export type VerifiedAuthenticationResponse = {
   verified: boolean;
-  authenticationInfo: {
+  authenticationInfo?: {
     credentialID: Base64URLString;
     newCounter: number;
     userVerified: boolean;
