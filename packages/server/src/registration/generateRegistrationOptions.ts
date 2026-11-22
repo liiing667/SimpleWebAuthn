@@ -12,6 +12,7 @@ import { generateChallenge } from '../helpers/generateChallenge.ts';
 import { generateUserID } from '../helpers/generateUserID.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { COSEALG } from '../helpers/cose.ts';
+import { RegistrationChallengeService } from '../services/registrationChallengeService.ts';
 
 export type GenerateRegistrationOptionsOpts = Parameters<typeof generateRegistrationOptions>[0];
 
@@ -160,6 +161,19 @@ export async function generateRegistrationOptions(
   if (!_userID) {
     _userID = await generateUserID();
   }
+  const userIDString = isoBase64URL.fromBuffer(_userID);
+  const challengeString = isoBase64URL.fromBuffer(_challenge);
+
+  /**
+   * Remember which user this registration challenge belongs to, and make the challenge
+   * single-use. The response can then return the same credential owner that authentication will
+   * later verify against.
+   */
+  RegistrationChallengeService.rememberChallenge({
+    challenge: challengeString,
+    userID: userIDString,
+    timeoutMS: timeout,
+  });
 
   /**
    * Map authenticator preference to hints. Map to authenticatorAttachment as well for
@@ -180,13 +194,13 @@ export async function generateRegistrationOptions(
   }
 
   return {
-    challenge: isoBase64URL.fromBuffer(_challenge),
+    challenge: challengeString,
     rp: {
       name: rpName,
       id: rpID,
     },
     user: {
-      id: isoBase64URL.fromBuffer(_userID),
+      id: userIDString,
       name: userName,
       displayName: userDisplayName,
     },

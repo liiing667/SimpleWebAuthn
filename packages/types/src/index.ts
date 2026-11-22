@@ -180,6 +180,19 @@ export type WebAuthnCredential = {
   counter: number;
   // From browser's `startRegistration()` -> RegistrationCredential.response.transports (API L2 and up)
   transports?: string[];
+  /**
+   * The RP's stable identifier for the user this credential belongs to. This is the same value
+   * that was provided as `userID` when generating registration options.
+   *
+   * RPs that support discoverable credentials should persist this alongside the credential so
+   * authentication responses can be checked against the credential's actual owner instead of
+   * trusting the `userHandle` returned by the authenticator.
+   */
+  userID?: Base64URLString;
+  /** Alias for `userID`, useful when persisting the credential's WebAuthn user handle. */
+  userHandle?: Base64URLString;
+  /** Alias for `userID`. */
+  ownerID?: Base64URLString;
 };
 
 /** */

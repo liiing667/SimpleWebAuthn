@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** Discoverable-credential authentication responses can now be bound to the
+  credential's registered owner. `generateAuthenticationOptions()` can freeze the acceptable
+  user/credential identities into a single-use challenge, and `verifyAuthenticationResponse()`
+  rejects responses whose `userHandle` does not match that owner. Identity-bound challenges are
+  wrapped in an opaque, generation-bound envelope so retries, concurrent submissions and process
+  restarts cannot revive an already-consumed challenge. Non-discoverable credentials and legacy
+  raw/padded `userHandle` values remain supported.
+
 ## v14.1.0
 
 **Changes:**

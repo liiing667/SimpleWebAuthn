@@ -26,6 +26,14 @@ Deno.test('should export service `ConvenienceMetadataService`', () => {
   assert(index.ConvenienceMetadataService);
 });
 
+Deno.test('should export service `AuthenticationChallengeService`', () => {
+  assert(index.AuthenticationChallengeService);
+});
+
+Deno.test('should export service `RegistrationChallengeService`', () => {
+  assert(index.RegistrationChallengeService);
+});
+
 Deno.test('should export service `SettingsService`', () => {
   assert(index.SettingsService);
 });

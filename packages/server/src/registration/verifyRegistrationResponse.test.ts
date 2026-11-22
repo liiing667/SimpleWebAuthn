@@ -3,6 +3,7 @@ import { assertSpyCall, assertSpyCalls, resolvesNext, returnsNext, stub } from '
 import { FakeTime } from '@std/testing/time';
 
 import { verifyRegistrationResponse } from './verifyRegistrationResponse.ts';
+import { generateRegistrationOptions } from './generateRegistrationOptions.ts';
 import type { RegistrationResponseJSON } from '../types/index.ts';
 import {
   _decodeAttestationObjectInternals,
@@ -22,8 +23,9 @@ import { denoSupportsPQC, FIDO_Conformance_Fake_Root } from '../helpers/tests/in
 import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
+import { RegistrationChallengeService } from '../services/registrationChallengeService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
-import { SimpleWebAuthnError } from '../errors/index.ts';
+import { CredentialBindingError, SimpleWebAuthnError } from '../errors/index.ts';
 
 /**
  * Trust the fake root for android-key since responses were captured from FIDO Conformance testing
@@ -1528,3 +1530,99 @@ const attestationNone: RegistrationResponseJSON = {
 const attestationNoneChallenge = isoBase64URL.fromUTF8String(
   'hEccPWuziP00H0p5gxh2_u5_PC4NeYgd',
 );
+
+function attestationNoneForChallenge(challenge: string): RegistrationResponseJSON {
+  const clientDataJSON = isoBase64URL.fromUTF8String(
+    JSON.stringify({
+      type: 'webauthn.create',
+      challenge,
+      origin: 'https://dev.dontneeda.pw',
+    }),
+  );
+
+  return {
+    ...attestationNone,
+    response: {
+      ...attestationNone.response,
+      clientDataJSON,
+    },
+  };
+}
+
+Deno.test('should remember the user ID a registration challenge belongs to', async () => {
+  RegistrationChallengeService.reset();
+
+  const userID = isoUint8Array.fromUTF8String('registration-owner');
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'owner@example.com',
+    userID,
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  const verification = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: options.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedUserID: options.user.id,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.registrationInfo.userID, options.user.id);
+  assertEquals(verification.registrationInfo.credential.userID, options.user.id);
+});
+
+Deno.test('should consume a registration challenge exactly once', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'single-use@example.com',
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+  const opts = {
+    response,
+    expectedChallenge: options.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedUserID: options.user.id,
+  };
+
+  const first = await verifyRegistrationResponse(opts);
+  assert(first.verified);
+
+  const error = (await assertRejects(
+    () => verifyRegistrationResponse(opts),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+  assertEquals(error.audit.stage, 'challenge_replay');
+});
+
+Deno.test('should reject a registration response for another user ID', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'bound@example.com',
+    userID: isoUint8Array.fromUTF8String('bound-user'),
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  const error = (await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: options.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedUserID: isoUint8Array.fromUTF8String('another-user'),
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+  assertEquals(error.audit.stage, 'user_id');
+  assertEquals(error.audit.credentialID, attestationNone.id);
+});

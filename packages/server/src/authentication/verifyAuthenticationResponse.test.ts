@@ -9,6 +9,7 @@ import {
 import { returnsNext, stub } from '@std/testing/mock';
 
 import { verifyAuthenticationResponse } from './verifyAuthenticationResponse.ts';
+import { generateAuthenticationOptions } from './generateAuthenticationOptions.ts';
 
 import type { AuthenticationResponseJSON, WebAuthnCredential } from '../types/index.ts';
 import { _decodeClientDataJSONInternals } from '../helpers/decodeClientDataJSON.ts';
@@ -19,7 +20,12 @@ import {
 import { toHash } from '../helpers/toHash.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { denoSupportsPQC } from '../helpers/tests/index.ts';
-import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
+import {
+  CredentialBindingError,
+  PQCNotSupportedError,
+  SimpleWebAuthnError,
+} from '../errors/index.ts';
+import { AuthenticationChallengeService } from '../services/authenticationChallengeService.ts';
 
 Deno.test('should verify an assertion response', async () => {
   const verification = await verifyAuthenticationResponse({
@@ -1078,3 +1084,399 @@ const authenticatorFirstTimeUsed: WebAuthnCredential = {
   id: 'wSisR0_4hlzw3Y1tj4uNwwifIhRa-ZxWJwWbnfror0pVK9qPdBPO5pW3gasPqn6wXHb0LNhXB_IrA1nFoSQJ9A',
   counter: 0,
 };
+
+function assertionWithUserHandle(userHandle: string): AuthenticationResponseJSON {
+  return {
+    ...assertionResponse,
+    response: {
+      ...assertionResponse.response,
+      userHandle,
+    },
+  };
+}
+
+function assertionWithChallenge(
+  challenge: string,
+  userHandle?: string,
+): AuthenticationResponseJSON {
+  const clientData = JSON.parse(
+    isoBase64URL.toUTF8String(assertionResponse.response.clientDataJSON),
+  );
+  const clientDataJSON = isoBase64URL.fromUTF8String(
+    JSON.stringify({ ...clientData, challenge }),
+  );
+
+  return {
+    ...assertionResponse,
+    response: {
+      ...assertionResponse.response,
+      clientDataJSON,
+      userHandle,
+    },
+  };
+}
+
+Deno.test('should bind a discoverable credential to its registered owner', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('discoverable-user-a');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionWithUserHandle(userA),
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, userID: userA },
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.authenticationInfo.userID, userA);
+  assertEquals(verification.authenticationInfo.credentialID, credential.id);
+  assertEquals(verification.authenticationInfo.sessionIdentity.userID, userA);
+  assertExists(verification.authenticationInfo.userHandleDigest);
+  assertExists(verification.authenticationInfo.challengeID);
+});
+
+Deno.test('should reject a discoverable credential carrying another user handle', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('owner-a');
+  const userB = isoBase64URL.fromUTF8String('owner-b');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA, userB],
+      requireUserBinding: true,
+    },
+  });
+
+  const error = (await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionWithUserHandle(userB),
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+
+  assertEquals(error.audit.stage, 'user_handle');
+  assertEquals(error.audit.credentialID, credential.id);
+  assertExists(error.audit.userHandleDigest);
+  assertExists(error.audit.expectedUserHandleDigest);
+});
+
+Deno.test('should consume an authentication challenge exactly once', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('single-use-user');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const opts = {
+    response: assertionWithUserHandle(userA),
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, userID: userA },
+    requireUserVerification: false,
+  };
+  const first = await verifyAuthenticationResponse(opts);
+  assert(first.verified);
+
+  const error = (await assertRejects(
+    () => verifyAuthenticationResponse(opts),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+  assertEquals(error.audit.stage, 'challenge_replay');
+});
+
+Deno.test('should consume the challenge even when the first identity check fails', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('first-attempt-owner');
+  const userB = isoBase64URL.fromUTF8String('first-attempt-wrong-handle');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionWithUserHandle(userB),
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  );
+
+  const error = (await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionWithUserHandle(userA),
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+  assertEquals(error.audit.stage, 'challenge_replay');
+});
+
+Deno.test('should allow only one concurrent authentication for a challenge', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('concurrent-user');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const opts = {
+    response: assertionWithUserHandle(userA),
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, userID: userA },
+    requireUserVerification: false,
+  };
+  const results = await Promise.allSettled([
+    verifyAuthenticationResponse(opts),
+    verifyAuthenticationResponse(opts),
+  ]);
+
+  assertEquals(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assertEquals(results.filter((result) => result.status === 'rejected').length, 1);
+});
+
+Deno.test('should keep non-discoverable credentials working without a userHandle', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('non-discoverable-user');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, userID: userA },
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.authenticationInfo.userID, userA);
+  assertEquals(verification.authenticationInfo.userHandle, undefined);
+});
+
+Deno.test('should accept a legacy raw userHandle that matches an encoded owner', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('legacy-internal-user');
+  const legacyUserHandle = 'legacy-internal-user';
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionWithUserHandle(legacyUserHandle),
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential: { ...credential, userID: userA },
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.authenticationInfo.userID, userA);
+});
+
+Deno.test('should reject a credential that was not offered by the challenge', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('offered-user');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialIDs: ['another-credential'],
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const error = (await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionWithUserHandle(userA),
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+
+  assertEquals(error.audit.stage, 'credential_id');
+});
+
+Deno.test('should reject a challenge issued by a previous service generation', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('restart-user');
+  const challenge = await AuthenticationChallengeService.issueChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+    bindGeneration: true,
+  });
+  const response = assertionWithChallenge(challenge, userA);
+
+  AuthenticationChallengeService.reset();
+
+  const error = (await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response,
+        expectedChallenge: challenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+
+  assertEquals(error.audit.stage, 'challenge_lookup');
+});
+
+Deno.test('should not commit a session if the service restarts mid-verification', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('mid-flight-restart-user');
+  await AuthenticationChallengeService.rememberChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: {
+      credentialOwners: { [credential.id]: userA },
+      userIDs: [userA],
+      requireUserBinding: true,
+    },
+  });
+
+  const error = (await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionWithUserHandle(userA),
+        expectedChallenge: (challenge) => {
+          AuthenticationChallengeService.reset();
+          return challenge === assertionChallenge;
+        },
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential: { ...credential, userID: userA },
+        requireUserVerification: false,
+      }),
+    CredentialBindingError,
+  )) as CredentialBindingError;
+  assertEquals(error.audit.stage, 'commit');
+});
+
+Deno.test('should freeze the acceptable user identity in generated options', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('frozen-user');
+  const options = await generateAuthenticationOptions({
+    rpID: 'dev.dontneeda.pw',
+    userID: userA,
+    timeout: 60000,
+  });
+  const record = AuthenticationChallengeService.getChallenge(options.challenge);
+
+  if (!record) {
+    throw new Error('Expected generated authentication challenge to be tracked');
+  }
+  assertEquals(record.binding.userIDs, [userA]);
+  assert(options.challenge !== assertionChallenge);
+});
+
+Deno.test('should invalidate an older envelope when a challenge is reissued', async () => {
+  AuthenticationChallengeService.reset();
+
+  const userA = isoBase64URL.fromUTF8String('reissue-user-a');
+  const userB = isoBase64URL.fromUTF8String('reissue-user-b');
+  const first = await AuthenticationChallengeService.issueChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: { userIDs: [userA], requireUserBinding: true },
+    bindGeneration: true,
+  });
+  const second = await AuthenticationChallengeService.issueChallenge({
+    challenge: assertionChallenge,
+    rpID: 'dev.dontneeda.pw',
+    binding: { userIDs: [userB], requireUserBinding: true },
+    bindGeneration: true,
+  });
+
+  assert(first !== second);
+  assertEquals(AuthenticationChallengeService.consumeChallenge(first).status, 'cancelled');
+  assertEquals(AuthenticationChallengeService.consumeChallenge(second).status, 'available');
+});
