@@ -1,6 +1,7 @@
 export * from './convertAAGUIDToString.ts';
 export * from './convertCertBufferToPEM.ts';
 export * from './convertCOSEtoPKCS.ts';
+export * from './credentialBackupState.ts';
 export * from './decodeAttestationObject.ts';
 export * from './decodeClientDataJSON.ts';
 export * from './decodeCredentialPublicKey.ts';

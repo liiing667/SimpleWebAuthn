@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** Credential backup eligibility (the BE flag) and backup state (the BS flag) are now
+  reconciled against the state persisted for a credential instead of being trusted blindly from
+  each response. A credential's device type is frozen at registration and can never regress from
+  `multiDevice` back to `singleDevice`, and backup state is now monotonic so a later response
+  claiming `BS=false` can no longer erase a previously observed backup. Legacy credentials stored
+  before this change are recoverably migrated on their next successful authentication (see
+  `authenticationInfo.backupStateMigrated`)
+- **[server]** `verifyRegistrationResponse()` now freezes the credential category, backup
+  eligibility, and a `backupPolicyVersion` onto the `registrationInfo.credential` record returned
+  at registration acceptance. Persist this object so that subsequent logins are always reconciled
+  against the same source of truth
+- **[server]** `verifyAuthenticationResponse()` now returns the reconciled
+  `credentialDeviceType`/`credentialBackedUp`, the raw `observedCredentialDeviceType`/
+  `observedCredentialBackedUp` flags, a persistable `credential` carrying the reconciled state,
+  and `backupStateMigrated`/`backupPolicyVersion` metadata
+- **[types]** `WebAuthnCredential` gains optional `credentialDeviceType`, `credentialBackedUp`,
+  and `backupPolicyVersion` properties for persisting the reconciled backup state alongside the
+  credential
+
 ## v14.1.0
 
 **Changes:**

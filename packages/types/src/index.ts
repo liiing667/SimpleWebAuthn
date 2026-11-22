@@ -180,6 +180,34 @@ export type WebAuthnCredential = {
   counter: number;
   // From browser's `startRegistration()` -> RegistrationCredential.response.transports (API L2 and up)
   transports?: string[];
+  /**
+   * Whether this credential was registered as a single-device or multi-device credential, as
+   * determined by the Backup Eligibility (BE) flag at registration time.
+   *
+   * This value is frozen at registration and never changes for the lifetime of the credential.
+   * Relying Parties should persist it so that subsequent authentications can be checked against
+   * the credential's fixed category instead of trusting the BE flag of any individual response.
+   *
+   * Credentials persisted before this property existed are migrated transparently on their next
+   * successful authentication; see `reconcileCredentialBackupState()`.
+   */
+  credentialDeviceType?: CredentialDeviceType;
+  /**
+   * Whether this credential is currently backed up, as determined by the Backup State (BS) flag.
+   *
+   * The value is only ever meaningful for multi-device credentials (it is always `false` for
+   * single-device credentials). It is persisted alongside the credential and may only transition
+   * in one direction: `false` -> `true` once a backup of the credential is observed. A later
+   * response claiming the credential is no longer backed up is treated as stale data and does not
+   * regress the persisted state.
+   */
+  credentialBackedUp?: boolean;
+  /**
+   * Version of the backup-state policy that produced the persisted `credentialDeviceType` and
+   * `credentialBackedUp` values. Bumping this version allows Relying Parties to identify records
+   * that need to be migrated and to ensure policy decisions can never silently regress.
+   */
+  backupPolicyVersion?: number;
 };
 
 /** */

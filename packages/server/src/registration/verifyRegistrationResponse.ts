@@ -18,6 +18,7 @@ import { decodeCredentialPublicKey } from '../helpers/decodeCredentialPublicKey.
 import { COSEKEYS, isPQCCOSEAlg } from '../helpers/cose.ts';
 import { convertAAGUIDToString } from '../helpers/convertAAGUIDToString.ts';
 import { parseBackupFlags } from '../helpers/parseBackupFlags.ts';
+import { freezeCredentialBackupState } from '../helpers/credentialBackupState.ts';
 import { matchExpectedRPID } from '../helpers/matchExpectedRPID.ts';
 import { isoBase64URL } from '../helpers/iso/index.ts';
 import { SettingsService } from '../services/settingsService.ts';
@@ -281,7 +282,20 @@ export async function verifyRegistrationResponse(
     return { verified: false };
   }
 
+  /**
+   * Freeze the credential's category (from the BE flag), its current backup state (from the BS
+   * flag), and the active backup policy version at registration acceptance. These values are the
+   * source of truth that every subsequent authentication for this credential is reconciled
+   * against, so they must be persisted by the Relying Party alongside the credential itself.
+   *
+   * `parseBackupFlags()` is still used so that the values exposed on `registrationInfo` remain
+   * identical to what previous versions of the library returned.
+   */
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
+  const frozenBackupState = freezeCredentialBackupState({
+    be: !!flags.be,
+    bs: !!flags.bs,
+  });
   const formattedAAGUID = convertAAGUIDToString(aaguid);
   // Try to pull provider metadata from either MDS service,
   const providerMetadata = await MetadataService.getProviderMetadata(formattedAAGUID) ??
@@ -294,11 +308,19 @@ export async function verifyRegistrationResponse(
       aaguid: formattedAAGUID,
       passkeyProviderMetadata: providerMetadata,
       credentialType,
+      /**
+       * The credential, enriched with the backup state frozen at registration. Relying Parties
+       * can persist this object directly so that later logins can be reconciled against the fixed
+       * category, backup eligibility, and policy version.
+       */
       credential: {
         id: isoBase64URL.fromBuffer(credentialID),
         publicKey: credentialPublicKey,
         counter,
         transports: response.response.transports,
+        credentialDeviceType: frozenBackupState.credentialDeviceType,
+        credentialBackedUp: frozenBackupState.credentialBackedUp,
+        backupPolicyVersion: frozenBackupState.backupPolicyVersion,
       },
       attestationObject,
       userVerified: flags.uv,
@@ -335,6 +357,11 @@ export async function verifyRegistrationResponse(
  * @param registrationInfo.credentialBackedUp Whether or not the multi-device credential has been
  * backed up. Always `false` for single-device credentials. **Should be kept in a DB for later
  * reference!**
+ * @param registrationInfo.credential The credential to persist, including the backup state
+ * frozen at registration: `credentialDeviceType` (the credential's fixed category from the BE
+ * flag), `credentialBackedUp` (the BS flag at registration), and `backupPolicyVersion` (the
+ * policy version in effect when the state was frozen). These values are the source of truth that
+ * later authentications are reconciled against.
  * @param registrationInfo.origin The origin of the website that the registration occurred on
  * @param registrationInfo?.rpID The RP ID that the registration occurred on, if one or more were
  * specified in the registration options

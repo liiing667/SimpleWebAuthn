@@ -566,6 +566,263 @@ Deno.test('should return credential backup info', async () => {
   assertEquals(verification.authenticationInfo?.credentialBackedUp, false);
 });
 
+/**
+ * Stub the BE/BS flags in the parsed authenticator data while leaving everything else (including
+ * the signature inputs) untouched, so that backup-state reconciliation can be exercised through
+ * the full `verifyAuthenticationResponse()` flow.
+ */
+function stubBackupFlags(be: boolean, bs: boolean) {
+  const actualData = parseAuthenticatorData(
+    isoBase64URL.toBuffer(assertionResponse.response.authenticatorData),
+  );
+
+  return stub(
+    _parseAuthenticatorDataInternals,
+    'stubThis',
+    returnsNext([
+      {
+        ...actualData,
+        flags: {
+          ...actualData.flags,
+          be,
+          bs,
+        },
+      },
+    ]),
+  );
+}
+
+Deno.test('should recoverably migrate a legacy credential and expose a persistable record', async () => {
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    // A credential persisted before backup state was tracked
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.authenticationInfo?.backupStateMigrated, true);
+  assertEquals(verification.authenticationInfo?.backupPolicyVersion, 1);
+  assertEquals(
+    verification.authenticationInfo?.credential.credentialDeviceType,
+    'singleDevice',
+  );
+  assertEquals(
+    verification.authenticationInfo?.credential.credentialBackedUp,
+    false,
+  );
+  assertEquals(verification.authenticationInfo?.credential.backupPolicyVersion, 1);
+  // The login conclusion matches the state that should be persisted
+  assertEquals(
+    verification.authenticationInfo?.credentialDeviceType,
+    verification.authenticationInfo?.credential.credentialDeviceType,
+  );
+});
+
+Deno.test('should not downgrade a persisted multi-device credential on a response with BE=false', async () => {
+  const multiDeviceCredential: WebAuthnCredential = {
+    ...credential,
+    credentialDeviceType: 'multiDevice',
+    credentialBackedUp: true,
+    backupPolicyVersion: 1,
+  };
+
+  const mockParseAuthData = stubBackupFlags(false, false);
+
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: assertionChallenge,
+      expectedOrigin: assertionOrigin,
+      expectedRPID: 'dev.dontneeda.pw',
+      credential: multiDeviceCredential,
+      requireUserVerification: false,
+    });
+
+    assertEquals(verification.verified, true);
+    // The stale response flags are still observable...
+    assertEquals(
+      verification.authenticationInfo?.observedCredentialDeviceType,
+      'singleDevice',
+    );
+    assertEquals(verification.authenticationInfo?.observedCredentialBackedUp, false);
+    // ...but the reconciled login conclusion and persisted state never regress
+    assertEquals(
+      verification.authenticationInfo?.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(verification.authenticationInfo?.credentialBackedUp, true);
+    assertEquals(
+      verification.authenticationInfo?.credential.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(verification.authenticationInfo?.credential.credentialBackedUp, true);
+    assertEquals(verification.authenticationInfo?.backupStateMigrated, false);
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
+Deno.test('should keep backup state monotonic when a later response claims BS=false', async () => {
+  const backedUpCredential: WebAuthnCredential = {
+    ...credential,
+    credentialDeviceType: 'multiDevice',
+    credentialBackedUp: true,
+    backupPolicyVersion: 1,
+  };
+
+  const mockParseAuthData = stubBackupFlags(true, false);
+
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: assertionChallenge,
+      expectedOrigin: assertionOrigin,
+      expectedRPID: 'dev.dontneeda.pw',
+      credential: backedUpCredential,
+      requireUserVerification: false,
+    });
+
+    assertEquals(verification.authenticationInfo?.credentialBackedUp, true);
+    assertEquals(
+      verification.authenticationInfo?.credential.credentialBackedUp,
+      true,
+    );
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
+Deno.test('should upgrade a single-device credential when the authenticator gains backup eligibility', async () => {
+  const singleDeviceCredential: WebAuthnCredential = {
+    ...credential,
+    credentialDeviceType: 'singleDevice',
+    credentialBackedUp: false,
+    backupPolicyVersion: 1,
+  };
+
+  const mockParseAuthData = stubBackupFlags(true, true);
+
+  try {
+    const verification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: assertionChallenge,
+      expectedOrigin: assertionOrigin,
+      expectedRPID: 'dev.dontneeda.pw',
+      credential: singleDeviceCredential,
+      requireUserVerification: false,
+    });
+
+    assertEquals(
+      verification.authenticationInfo?.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(verification.authenticationInfo?.credentialBackedUp, true);
+    assertEquals(
+      verification.authenticationInfo?.credential.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(verification.authenticationInfo?.credential.credentialBackedUp, true);
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
+Deno.test('should reject the impossible BE=false, BS=true combination during authentication', async () => {
+  const mockParseAuthData = stubBackupFlags(false, true);
+
+  try {
+    await assertRejects(
+      () =>
+        verifyAuthenticationResponse({
+          response: assertionResponse,
+          expectedChallenge: assertionChallenge,
+          expectedOrigin: assertionOrigin,
+          expectedRPID: 'dev.dontneeda.pw',
+          credential,
+          requireUserVerification: false,
+        }),
+      Error,
+      'impossible',
+    );
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
+Deno.test('should keep single-device and multi-device credentials logging in under their own policies', async () => {
+  /**
+   * A legitimately-registered single-device credential (BE=0, BS=0) keeps logging in as
+   * single-device...
+   */
+  const singleDeviceCredential: WebAuthnCredential = {
+    ...credential,
+    credentialDeviceType: 'singleDevice',
+    credentialBackedUp: false,
+    backupPolicyVersion: 1,
+  };
+
+  const singleDeviceMock = stubBackupFlags(false, false);
+
+  try {
+    const singleDeviceVerification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: assertionChallenge,
+      expectedOrigin: assertionOrigin,
+      expectedRPID: 'dev.dontneeda.pw',
+      credential: singleDeviceCredential,
+      requireUserVerification: false,
+    });
+
+    assertEquals(singleDeviceVerification.verified, true);
+    assertEquals(
+      singleDeviceVerification.authenticationInfo?.credentialDeviceType,
+      'singleDevice',
+    );
+    assertEquals(
+      singleDeviceVerification.authenticationInfo?.credentialBackedUp,
+      false,
+    );
+  } finally {
+    singleDeviceMock.restore();
+  }
+
+  /**
+   * ...while an existing synced (multi-device, backed-up) credential keeps logging in as
+   * multi-device even when an individual response omits the backup flags.
+   */
+  const syncedCredential: WebAuthnCredential = {
+    ...credential,
+    credentialDeviceType: 'multiDevice',
+    credentialBackedUp: true,
+    backupPolicyVersion: 1,
+  };
+
+  const syncedMock = stubBackupFlags(false, false);
+
+  try {
+    const syncedVerification = await verifyAuthenticationResponse({
+      response: assertionResponse,
+      expectedChallenge: assertionChallenge,
+      expectedOrigin: assertionOrigin,
+      expectedRPID: 'dev.dontneeda.pw',
+      credential: syncedCredential,
+      requireUserVerification: false,
+    });
+
+    assertEquals(syncedVerification.verified, true);
+    assertEquals(
+      syncedVerification.authenticationInfo?.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(syncedVerification.authenticationInfo?.credentialBackedUp, true);
+  } finally {
+    syncedMock.restore();
+  }
+});
+
 Deno.test('should return user verified flag after successful auth', async () => {
   const verification = await verifyAuthenticationResponse({
     response: assertionResponse,

@@ -940,6 +940,106 @@ Deno.test('should return credential backup info', async () => {
   assertEquals(verification.registrationInfo?.credentialBackedUp, false);
 });
 
+/**
+ * Stub the BE/BS flags in the attestation's authenticator data while preserving the rest of the
+ * captured registration response.
+ */
+function stubRegistrationBackupFlags(be: boolean, bs: boolean) {
+  const authData = decodeAttestationObject(
+    isoBase64URL.toBuffer(attestationNone.response.attestationObject),
+  ).get('authData');
+  const actualAuthData = parseAuthenticatorData(authData);
+
+  return stub(
+    _parseAuthenticatorDataInternals,
+    'stubThis',
+    returnsNext([
+      {
+        ...actualAuthData,
+        flags: {
+          ...actualAuthData.flags,
+          be,
+          bs,
+        },
+      },
+    ]),
+  );
+}
+
+Deno.test('should freeze credential category, backup state, and policy version at registration', async () => {
+  const mockParseAuthData = stubRegistrationBackupFlags(true, true);
+
+  try {
+    const verification = await verifyRegistrationResponse({
+      response: attestationNone,
+      expectedChallenge: attestationNoneChallenge,
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      expectedRPID: 'dev.dontneeda.pw',
+    });
+
+    assert(verification.verified);
+    assertEquals(verification.registrationInfo?.credentialDeviceType, 'multiDevice');
+    assertEquals(verification.registrationInfo?.credentialBackedUp, true);
+
+    // The persistable credential carries the same frozen state plus a policy version
+    assertEquals(
+      verification.registrationInfo?.credential.credentialDeviceType,
+      'multiDevice',
+    );
+    assertEquals(verification.registrationInfo?.credential.credentialBackedUp, true);
+    assertEquals(verification.registrationInfo?.credential.backupPolicyVersion, 1);
+
+    // The login-facing values and the persistable record stay consistent
+    assertEquals(
+      verification.registrationInfo?.credential.credentialDeviceType,
+      verification.registrationInfo?.credentialDeviceType,
+    );
+    assertEquals(
+      verification.registrationInfo?.credential.credentialBackedUp,
+      verification.registrationInfo?.credentialBackedUp,
+    );
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
+Deno.test('should freeze a single-device credential with the policy version at registration', async () => {
+  const verification = await verifyRegistrationResponse({
+    response: attestationNone,
+    expectedChallenge: attestationNoneChallenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+  });
+
+  assert(verification.verified);
+  assertEquals(
+    verification.registrationInfo?.credential.credentialDeviceType,
+    'singleDevice',
+  );
+  assertEquals(verification.registrationInfo?.credential.credentialBackedUp, false);
+  assertEquals(verification.registrationInfo?.credential.backupPolicyVersion, 1);
+});
+
+Deno.test('should reject an impossible BE=false, BS=true combination at registration', async () => {
+  const mockParseAuthData = stubRegistrationBackupFlags(false, true);
+
+  try {
+    await assertRejects(
+      () =>
+        verifyRegistrationResponse({
+          response: attestationNone,
+          expectedChallenge: attestationNoneChallenge,
+          expectedOrigin: 'https://dev.dontneeda.pw',
+          expectedRPID: 'dev.dontneeda.pw',
+        }),
+      Error,
+      'impossible',
+    );
+  } finally {
+    mockParseAuthData.restore();
+  }
+});
+
 Deno.test('should return passkey provider metadata for a credential AAGUID', async () => {
   const providerMetadata: ProviderMetadata = { friendlyNames: { en: 'Test Provider' } };
   using mockGetProviderMetadata = stub(

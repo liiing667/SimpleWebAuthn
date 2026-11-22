@@ -10,6 +10,10 @@ import { toHash } from '../helpers/toHash.ts';
 import { verifySignature } from '../helpers/verifySignature.ts';
 import { parseAuthenticatorData } from '../helpers/parseAuthenticatorData.ts';
 import { parseBackupFlags } from '../helpers/parseBackupFlags.ts';
+import {
+  reconcileCredentialBackupState,
+  withReconciledBackupState,
+} from '../helpers/credentialBackupState.ts';
 import type { AuthenticationExtensionsAuthenticatorOutputs } from '../helpers/decodeAuthenticatorExtensions.ts';
 import { matchExpectedRPID } from '../helpers/matchExpectedRPID.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
@@ -288,7 +292,34 @@ export async function verifyAuthenticationResponse(
     throw new PQCNotSupportedError(pubKeyAlg);
   }
 
-  const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
+  /**
+   * Reconcile the observed flags against the backup state persisted for this credential. This is
+   * what keeps the login conclusion consistent with the stored record:
+   *
+   * - Legacy credentials without a policy version are recoverably migrated
+   * - A credential's device type can never regress (multi-device stays multi-device)
+   * - Backup state is monotonic and can never flip back from backed-up to not-backed-up
+   * - Concurrent verification flows converge on the same persistable values
+   *
+   * The reconciliation also enforces the library's historical interpretation of the flags,
+   * including raising `InvalidBackupFlags` for the spec-impossible BE=0, BS=1 combination.
+   */
+  const reconciled = reconcileCredentialBackupState({
+    credential,
+    observed: { be: !!flags.be, bs: !!flags.bs },
+  });
+
+  /**
+   * The backup flags as derived purely from this response's authenticator data. Exposed for
+   * inspection via `observedCredentialDeviceType`/`observedCredentialBackedUp`.
+   */
+  const parsed = parseBackupFlags(flags);
+
+  /**
+   * A copy of the credential carrying the reconciled, persistable backup state. Relying Parties
+   * should store this object so that the next login starts from the migrated/upgraded record.
+   */
+  const persistedCredential = withReconciledBackupState(credential, reconciled);
 
   const toReturn: VerifiedAuthenticationResponse = {
     verified: await verifySignature({
@@ -300,8 +331,28 @@ export async function verifyAuthenticationResponse(
       newCounter: counter,
       credentialID: credential.id,
       userVerified: flags.uv,
-      credentialDeviceType,
-      credentialBackedUp,
+      /**
+       * The values below describe the credential's reconciled state so that the login conclusion
+       * always matches what should be persisted, rather than the raw flags of this one response.
+       */
+      credentialDeviceType: reconciled.credentialDeviceType,
+      credentialBackedUp: reconciled.credentialBackedUp,
+      /**
+       * The backup flags exactly as observed in this response, for Relying Parties that want to
+       * inspect what the authenticator claimed independently of the reconciled state.
+       */
+      observedCredentialDeviceType: parsed.credentialDeviceType,
+      observedCredentialBackedUp: parsed.credentialBackedUp,
+      /**
+       * The credential enriched with the reconciled backup state, ready to be persisted.
+       */
+      credential: persistedCredential,
+      /**
+       * `true` when the supplied credential was a legacy record (no policy version) that was just
+       * migrated to the current backup-state policy.
+       */
+      backupStateMigrated: reconciled.migrated,
+      backupPolicyVersion: reconciled.backupPolicyVersion,
       authenticatorExtensionResults: extensionsData,
       origin: clientDataJSON.origin,
       rpID: matchedRPID,
@@ -326,6 +377,17 @@ export async function verifyAuthenticationResponse(
  * @param authenticationInfo.credentialBackedUp Whether or not the multi-device credential has been
  * backed up. Always `false` for single-device credentials. **Should be kept in a DB for later
  * reference!**
+ * @param authenticationInfo.observedCredentialDeviceType The device type derived only from the BE
+ * flag of this response, before reconciliation against the persisted credential state.
+ * @param authenticationInfo.observedCredentialBackedUp The backup state derived only from the BS
+ * flag of this response, before reconciliation against the persisted credential state.
+ * @param authenticationInfo.credential The credential enriched with the reconciled
+ * `credentialDeviceType`, `credentialBackedUp`, and `backupPolicyVersion`. Persist this object so
+ * that the credential's backup policy never regresses and legacy records stay migrated.
+ * @param authenticationInfo.backupStateMigrated Whether the supplied credential was a legacy
+ * record (without a backup policy version) that was just migrated to the current policy.
+ * @param authenticationInfo.backupPolicyVersion The backup-state policy version applied to the
+ * returned credential state.
  * @param authenticationInfo.origin The origin of the website that the authentication occurred on
  * @param authenticationInfo.rpID The RP ID that the authentication occurred on
  * @param authenticationInfo?.authenticatorExtensionResults The authenticator extensions returned
@@ -337,8 +399,41 @@ export type VerifiedAuthenticationResponse = {
     credentialID: Base64URLString;
     newCounter: number;
     userVerified: boolean;
+    /**
+     * The credential's reconciled device type. This matches the value persisted for the
+     * credential and can never regress from `multiDevice` back to `singleDevice`.
+     */
     credentialDeviceType: CredentialDeviceType;
+    /**
+     * The credential's reconciled backup state. Monotonic: once `true` it stays `true`, and it
+     * is always `false` for single-device credentials.
+     */
     credentialBackedUp: boolean;
+    /**
+     * The device type derived solely from the BE flag of this response's authenticator data.
+     * Exposed for inspection; prefer `credentialDeviceType` for any policy decision.
+     */
+    observedCredentialDeviceType: CredentialDeviceType;
+    /**
+     * The backup state derived solely from the BS flag of this response's authenticator data.
+     * Exposed for inspection; prefer `credentialBackedUp` for any policy decision.
+     */
+    observedCredentialBackedUp: boolean;
+    /**
+     * A copy of the credential passed into verification, enriched with the reconciled
+     * `credentialDeviceType`, `credentialBackedUp`, and `backupPolicyVersion` values. Persist
+     * this object after a successful verification.
+     */
+    credential: WebAuthnCredential;
+    /**
+     * Whether the supplied credential was a legacy record without a backup policy version that
+     * was just migrated to the current policy.
+     */
+    backupStateMigrated: boolean;
+    /**
+     * The backup-state policy version in effect for the returned (reconciled) credential state.
+     */
+    backupPolicyVersion: number;
     origin: string;
     rpID: string;
     authenticatorExtensionResults?: AuthenticationExtensionsAuthenticatorOutputs;
