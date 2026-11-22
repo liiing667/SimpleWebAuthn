@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[browser]** `WebAuthnAbortService` now tracks a tab ceremony identity and generation across
+  starts, manual cancellation and page reloads. `startAuthentication()` and `startRegistration()`
+  reject a result that resolves after its ceremony was superseded, and responses carry the browser
+  and server ceremony metadata back to the RP.
+- **[server]** `generateAuthenticationOptions()` now freezes an optional ceremony/session
+  generation into the challenge. Repeating a start for the same login session supersedes older
+  pending challenges; `verifyAuthenticationResponse()` consumes the challenge exactly once and
+  rejects cancelled, replayed, stale-generation and old-process challenges with a structured
+  `ChallengeContextError.audit` report. Successful verification returns
+  `authenticationInfo.session` so the final login session comes from the same generation.
+- **[server]** Legacy caller-managed challenges, ordinary single-tab authentication, conditional UI
+  and the historical positional options structure remain compatible.
+
 ## v14.1.0
 
 **Changes:**

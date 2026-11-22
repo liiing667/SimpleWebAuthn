@@ -5,6 +5,8 @@ export * from './authentication/verifyAuthenticationResponse.ts';
 export * from './services/metadataService.ts';
 export * from './services/convenienceMetadataService.ts';
 export * from './services/settingsService.ts';
+export * from './services/challengeContextService.ts';
 export * from './metadata/mdsTypes.ts';
 export * from './types/index.ts';
+export * from './types/audit.ts';
 export * from './errors/index.ts';

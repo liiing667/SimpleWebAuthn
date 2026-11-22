@@ -19,7 +19,12 @@ import {
 import { toHash } from '../helpers/toHash.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { denoSupportsPQC } from '../helpers/tests/index.ts';
-import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
+import {
+  ChallengeContextError,
+  PQCNotSupportedError,
+  SimpleWebAuthnError,
+} from '../errors/index.ts';
+import { ChallengeContextService } from '../services/challengeContextService.ts';
 
 Deno.test('should verify an assertion response', async () => {
   const verification = await verifyAuthenticationResponse({
@@ -1022,6 +1027,144 @@ Deno.test('should raise on trailing slash in origin for expectedOrigin', async (
   );
 
   assert(error.message.includes('Remove the trailing "/"'), 'did not include remediation');
+});
+
+Deno.test('should reject a replayed tracked authentication challenge', async () => {
+  ChallengeContextService.reset();
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+    },
+  });
+
+  const first = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+  });
+  assertEquals(first.verified, true);
+  assertExists(first.authenticationInfo.session);
+  assertExists(first.authenticationInfo.session?.ceremonyID);
+  assertExists(first.authenticationInfo.session?.challengeID);
+  assertEquals(
+    first.authenticationInfo.session?.generation,
+    ChallengeContextService.generation,
+  );
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+  assertEquals((error as ChallengeContextError).audit.stage, 'challenge_replay');
+});
+
+Deno.test('should reject a cancelled tracked authentication challenge', async () => {
+  ChallengeContextService.reset();
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+    },
+  });
+  ChallengeContextService.cancelChallenge(
+    assertionChallenge,
+    'browser tab cancelled the ceremony',
+  );
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'challenge_cancellation');
+  assertEquals(audit.ceremony, 'authentication');
+  assertExists(audit.challengeID);
+});
+
+Deno.test('should not revive an authentication challenge after a simulated refresh/restart', async () => {
+  ChallengeContextService.reset();
+  const issuedChallenge = await ChallengeContextService.issueChallenge({
+    ceremony: 'authentication',
+    challenge: assertionChallenge,
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+    },
+  });
+  const issuedRecord = ChallengeContextService.getChallenge(issuedChallenge)!;
+
+  ChallengeContextService.reset('page refreshed');
+
+  const responseWithIssuedChallenge: AuthenticationResponseJSON = {
+    ...assertionResponse,
+    response: {
+      ...assertionResponse.response,
+      clientDataJSON: isoBase64URL.fromUTF8String(
+        JSON.stringify({
+          type: 'webauthn.get',
+          challenge: issuedChallenge,
+          origin: assertionOrigin,
+        }),
+      ),
+    },
+  };
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: responseWithIssuedChallenge,
+        expectedChallenge: issuedChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'challenge_lookup');
+  assertEquals(audit.ceremonyID, issuedRecord.ceremonyID);
+  assertExists(audit.ceremonyGeneration);
+});
+
+Deno.test('should keep legacy stateless authentication working', async () => {
+  ChallengeContextService.reset();
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo.session, undefined);
 });
 
 const assertionResponse: AuthenticationResponseJSON = {

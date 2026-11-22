@@ -250,9 +250,52 @@ describe('Method: startRegistration', () => {
     const abortSpy = spy(AbortController.prototype, 'abort');
 
     // Fire off a request and immediately attempt a second one
-    startRegistration({ optionsJSON: goodOpts1 });
+    // The first ceremony is expected to reject as stale; handle it so the test observes the
+    // cancellation behavior without leaving an unhandled rejection.
+    startRegistration({ optionsJSON: goodOpts1 }).catch(() => {});
     await startRegistration({ optionsJSON: goodOpts1 });
     assertSpyCalls(abortSpy, 1);
+  });
+
+  it('should reject a registration result that resolves after another ceremony starts', async () => {
+    let resolveFirst: ((value: unknown) => void) | undefined;
+    const firstResult = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const validCredential = {
+      id: '6mUg8GzxDxs',
+      rawId: base64URLStringToBuffer('6mUg8GzxDxs'),
+      response: {
+        attestationObject: new Uint8Array([1, 2, 3, 4]),
+        clientDataJSON: new Uint8Array([5, 6, 7, 8]),
+        getTransports: () => [],
+        getAuthenticatorData: () => new Uint8Array(),
+        getPublicKey: () => null,
+        getPublicKeyAlgorithm: () => -7,
+      },
+      getClientExtensionResults: () => ({}),
+      type: 'public-key',
+      authenticatorAttachment: '',
+    };
+
+    let createCallCount = 0;
+    // @ts-ignore: Stub credman for the race
+    globalThis.navigator.credentials.create = () => {
+      createCallCount += 1;
+      return createCallCount === 1 ? firstResult : Promise.resolve(validCredential);
+    };
+
+    const firstCeremony = startRegistration({ optionsJSON: goodOpts1 });
+    await startRegistration({ optionsJSON: goodOpts1 });
+
+    resolveFirst!(validCredential);
+
+    const error = await assertRejects(
+      () => firstCeremony,
+      WebAuthnError,
+    );
+    assertEquals((error as WebAuthnError).code, 'ERROR_CEREMONY_ABORTED');
   });
 
   it('should return authenticatorAttachment if present', async () => {

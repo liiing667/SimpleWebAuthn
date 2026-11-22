@@ -16,8 +16,25 @@ import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { decodeCredentialPublicKey } from '../helpers/decodeCredentialPublicKey.ts';
 import { COSEKEYS, isPQCCOSEAlg } from '../helpers/cose.ts';
 import { SettingsService } from '../services/settingsService.ts';
-import { PQCNotSupportedError } from '../errors/index.ts';
+import {
+  ChallengeContextError,
+  PQCNotSupportedError,
+} from '../errors/index.ts';
 import { matchExpectedOrigin } from '../helpers/matchExpectedOrigin.ts';
+import {
+  ChallengeContextService,
+  type ChallengeContextRecord,
+  type ChallengeConsumption,
+} from '../services/challengeContextService.ts';
+import {
+  assertChallengeResponseContext,
+  challengeConsumptionError,
+} from '../helpers/ceremonyVerification.ts';
+import type {
+  ChallengeAudit,
+  VerifiedSessionIdentity,
+  VerificationStage,
+} from '../types/audit.ts';
 
 /**
  * Configurable options when calling `verifyAuthenticationResponse()`
@@ -34,6 +51,15 @@ export type VerifyAuthenticationResponseOpts = Parameters<typeof verifyAuthentic
  * @param expectedOrigin - Website URL (or array of URLs) that the registration should have occurred on
  * @param expectedRPID - RP ID (or array of IDs) that was specified in the registration options
  * @param credential - An internal {@link WebAuthnCredential} corresponding to `id` in the authentication response
+ * @param expectedCeremonyID **(Optional)** - Browser/tab ceremony identity that must match the
+ * challenge record. Can be a predicate for RPs that store the identity externally.
+ * @param expectedCeremonyGeneration **(Optional)** - Ceremony generation that must match the
+ * challenge record.
+ * @param sessionKey **(Optional)** - Login-session identity consuming this response. Required when
+ * the challenge was generated with a session key.
+ * @param expectedTenant **(Optional)** - Tenant/account identity consuming this response.
+ * @param requireCeremony **(Optional)** - Reject a response whose challenge was not issued by this
+ * process. Defaults to `false` for legacy stateless callers.
  * @param expectedType **(Optional)** - The response type expected ('webauthn.get')
  * @param requireUserVerification **(Optional)** - Enforce user verification by the authenticator (via PIN, fingerprint, etc...) Defaults to `true`
  * @param advancedFIDOConfig **(Optional)** - Options for satisfying more stringent FIDO RP feature requirements
@@ -46,6 +72,31 @@ export async function verifyAuthenticationResponse(
     expectedOrigin: string | string[];
     expectedRPID: string | string[];
     credential: WebAuthnCredential;
+    expectedCeremonyID?: string | ((ceremonyID: string | undefined) => boolean | Promise<boolean>);
+    /** Aggregated ceremony expectation alias. */
+    ceremony?: {
+      id?: string;
+      generation?: number;
+      challengeID?: string;
+      sessionKey?: string;
+    };
+    expectedCeremonyGeneration?: number;
+    /** Alias for `expectedCeremonyGeneration`. */
+    expectedGeneration?: number;
+    sessionKey?: string;
+    /** Alias for `sessionKey`. */
+    sessionID?: string;
+    /** Alias for `sessionKey`. */
+    loginSessionID?: string;
+    expectedSessionKey?: string;
+    expectedTenant?: string;
+    /** Alias for `expectedTenant`. */
+    tenant?: string;
+    /** Alias for `expectedTenant`. */
+    tenantId?: string;
+    requireCeremony?: boolean;
+    /** Alias for `requireCeremony`. */
+    requireChallengeContext?: boolean;
     expectedType?: string | string[];
     expectedTopOrigin?: string | string[];
     requireUserVerification?: boolean;
@@ -62,9 +113,43 @@ export async function verifyAuthenticationResponse(
     expectedType,
     expectedTopOrigin,
     credential,
+    expectedCeremonyID,
+    ceremony: expectedCeremony,
+    expectedCeremonyGeneration,
+    expectedGeneration,
+    sessionKey,
+    sessionID,
+    loginSessionID,
+    expectedSessionKey,
+    expectedTenant,
+    tenant,
+    tenantId,
+    requireCeremony,
+    requireChallengeContext,
     requireUserVerification = true,
     advancedFIDOConfig,
   } = options;
+  const expectedCeremonyGenerationValue = expectedCeremonyGeneration ??
+    expectedGeneration ?? expectedCeremony?.generation;
+  const expectedCeremonyIDValue = typeof expectedCeremonyID === 'string'
+    ? expectedCeremonyID
+    : (expectedCeremonyID === undefined ? expectedCeremony?.id : undefined);
+  const sessionKeyValue = sessionKey ?? sessionID ?? loginSessionID ??
+    expectedSessionKey ?? expectedCeremony?.sessionKey;
+  const expectedChallengeIDValue = expectedCeremony?.challengeID;
+  const sessionTenant = expectedTenant ?? tenant ?? tenantId;
+  const ceremonyRequired = requireCeremony ?? requireChallengeContext ?? false;
+  const callerExpectedOrigins = Array.isArray(options.expectedOrigin)
+    ? [...options.expectedOrigin]
+    : [options.expectedOrigin];
+  const callerExpectedRPIDs = Array.isArray(options.expectedRPID)
+    ? [...options.expectedRPID]
+    : [options.expectedRPID];
+  const ceremonyExpected = ceremonyRequired ||
+    expectedCeremonyIDValue !== undefined ||
+    expectedChallengeIDValue !== undefined ||
+    typeof expectedCeremonyID === 'function' ||
+    expectedCeremonyGenerationValue !== undefined;
   const { id, rawId, type: credentialType, response: assertionResponse } = response;
 
   // Ensure credential specified an ID
@@ -95,6 +180,192 @@ export async function verifyAuthenticationResponse(
   const clientDataJSON = decodeClientDataJSON(assertionResponse.clientDataJSON);
 
   const { type, origin, challenge, tokenBinding, crossOrigin, topOrigin } = clientDataJSON;
+
+  const responseCeremonyID = response.ceremonyID ?? response.ceremony?.id;
+  const responseCeremonyGeneration = response.ceremonyGeneration ??
+    response.serverCeremonyGeneration ??
+    response.ceremony?.generation;
+
+  /**
+   * Consume the challenge synchronously, before the caller's challenge verifier or any async
+   * signature work. If this challenge was issued with a ceremony/session generation, the
+   * pending -> used transition is the single-use fence that prevents a second tab, retry or
+   * process from consuming it again.
+   */
+  const challengeConsumption: ChallengeConsumption = ChallengeContextService.consumeChallenge({
+    challenge,
+    ceremony: 'authentication',
+    sessionKey: sessionKeyValue,
+    ceremonyID: responseCeremonyID ??
+      expectedCeremonyIDValue,
+    ceremonyGeneration: responseCeremonyGeneration ?? expectedCeremonyGenerationValue,
+  });
+  const challengeRecord: ChallengeContextRecord | undefined = challengeConsumption.record;
+  const exposeSession = challengeRecord !== undefined;
+  const challengeAuditContext: Partial<ChallengeAudit> | undefined = challengeRecord
+    ? {
+      ceremony: 'authentication',
+      stage: 'challenge',
+      reason: 'challenge context check',
+      actualOrigin: origin,
+      expectedOrigins: challengeRecord.context.origins,
+      callerExpectedOrigins,
+      expectedRPID: challengeRecord.context.rpID || undefined,
+      callerExpectedRPIDs,
+      challengeID: challengeRecord.challengeID,
+      ceremonyID: challengeRecord.ceremonyID,
+      browserCeremonyID: response.browserCeremonyID,
+      ceremonyGeneration: challengeRecord.ceremonyGeneration,
+      generation: challengeRecord.generation,
+      challengeGeneration: challengeRecord.generation,
+      currentGeneration: ChallengeContextService.generation,
+      tenant: sessionTenant,
+      challengeTenant: challengeRecord.context.tenant,
+      sessionKey: sessionKeyValue,
+      challengeSessionKey: challengeRecord.sessionKey,
+    }
+    : undefined;
+
+  if (!challengeConsumption.tracked && ceremonyExpected) {
+    throw challengeConsumptionError({
+      consumption: {
+        ...challengeConsumption,
+        tracked: true,
+        status: 'missing' as const,
+      },
+      ceremony: 'authentication',
+      actualOrigin: origin,
+      tenant: sessionTenant,
+      sessionKey: sessionKeyValue,
+      browserCeremonyID: response.browserCeremonyID,
+      callerExpectedOrigins,
+      callerExpectedRPIDs,
+    });
+  }
+
+  if (
+    challengeConsumption.tracked &&
+    challengeConsumption.status !== 'available'
+  ) {
+    throw challengeConsumptionError({
+      consumption: challengeConsumption,
+      ceremony: 'authentication',
+      actualOrigin: origin,
+      tenant: sessionTenant,
+      sessionKey: sessionKeyValue,
+      browserCeremonyID: response.browserCeremonyID,
+      callerExpectedOrigins,
+      callerExpectedRPIDs,
+    });
+  }
+
+  if (
+    challengeRecord !== undefined &&
+    typeof expectedCeremonyID === 'function' &&
+    !(await expectedCeremonyID(challengeRecord.ceremonyID))
+  ) {
+    const audit: ChallengeAudit = {
+      ceremony: 'authentication',
+      stage: 'ceremony',
+      location:
+        'packages/server/src/authentication/verifyAuthenticationResponse.ts:verifyAuthenticationResponse#ceremony',
+      reason: 'Authentication response ceremony identity did not match the expected ceremony',
+      actualOrigin: origin,
+      expectedOrigins: challengeRecord.context.origins,
+      callerExpectedOrigins,
+      expectedRPID: challengeRecord.context.rpID || undefined,
+      callerExpectedRPIDs,
+      challengeID: challengeRecord.challengeID,
+      ceremonyID: challengeRecord.ceremonyID,
+      browserCeremonyID: response.browserCeremonyID,
+      tabID: response.browserCeremonyID ?? challengeRecord.ceremonyID,
+      ceremonyGeneration: challengeRecord.ceremonyGeneration,
+      generation: challengeRecord.generation,
+      currentGeneration: ChallengeContextService.generation,
+      sessionKey: sessionKeyValue,
+      timestamp: new Date().toISOString(),
+    };
+    throw new ChallengeContextError({
+      message: audit.reason,
+      code: 'CEREMONY_KIND_MISMATCH',
+      audit,
+    });
+  }
+
+  if (
+    challengeRecord !== undefined &&
+    expectedChallengeIDValue !== undefined &&
+    challengeRecord.challengeID !== expectedChallengeIDValue
+  ) {
+    const reason =
+      `Authentication challenge handle "${challengeRecord.challengeID}" did not match ` +
+      `the expected handle "${expectedChallengeIDValue}"`;
+    throw new ChallengeContextError({
+      message: reason,
+      code: 'CHALLENGE_STALE_GENERATION',
+      audit: {
+        ...(challengeAuditContext ?? {}),
+        ceremony: 'authentication',
+        stage: 'challenge_generation',
+        location:
+          'packages/server/src/authentication/verifyAuthenticationResponse.ts:verifyAuthenticationResponse#challengeGeneration',
+        reason,
+        actualOrigin: origin,
+        expectedOrigins: challengeRecord.context.origins,
+        callerExpectedOrigins,
+        expectedRPID: challengeRecord.context.rpID || undefined,
+        callerExpectedRPIDs,
+        tenant: sessionTenant,
+        challengeTenant: challengeRecord.context.tenant,
+        challengeID: challengeRecord.challengeID,
+        ceremonyID: challengeRecord.ceremonyID,
+        browserCeremonyID: response.browserCeremonyID,
+        tabID: response.browserCeremonyID ?? challengeRecord.ceremonyID,
+        ceremonyGeneration: challengeRecord.ceremonyGeneration,
+        generation: challengeRecord.generation,
+        challengeGeneration: challengeRecord.generation,
+        currentGeneration: ChallengeContextService.generation,
+        sessionKey: sessionKeyValue,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  if (
+    challengeRecord !== undefined &&
+    expectedCeremonyGenerationValue !== undefined &&
+    challengeRecord.ceremonyGeneration !== expectedCeremonyGenerationValue &&
+    challengeRecord.generation !== expectedCeremonyGenerationValue
+  ) {
+    const audit: ChallengeAudit = {
+      ceremony: 'authentication',
+      stage: 'challenge_generation',
+      location:
+        'packages/server/src/authentication/verifyAuthenticationResponse.ts:verifyAuthenticationResponse#generation',
+      reason:
+        `Authentication challenge generation ${challengeRecord.ceremonyGeneration} ` +
+        `did not match expected generation ${expectedCeremonyGenerationValue}`,
+      actualOrigin: origin,
+      expectedOrigins: challengeRecord.context.origins,
+      callerExpectedOrigins,
+      expectedRPID: challengeRecord.context.rpID || undefined,
+      callerExpectedRPIDs,
+      challengeID: challengeRecord.challengeID,
+      ceremonyID: challengeRecord.ceremonyID,
+      browserCeremonyID: response.browserCeremonyID,
+      tabID: response.browserCeremonyID ?? challengeRecord.ceremonyID,
+      ceremonyGeneration: challengeRecord.ceremonyGeneration,
+      generation: challengeRecord.generation,
+      currentGeneration: ChallengeContextService.generation,
+      sessionKey: sessionKeyValue,
+      timestamp: new Date().toISOString(),
+    };
+    throw new ChallengeContextError({
+      message: audit.reason,
+      code: 'CHALLENGE_STALE_GENERATION',
+      audit,
+    });
+  }
 
   // Make sure we're handling an authentication
   if (Array.isArray(expectedType)) {
@@ -174,7 +445,7 @@ export async function verifyAuthenticationResponse(
   }
 
   // Check that the origin is our site
-  matchExpectedOrigin(origin, expectedOrigin);
+  matchExpectedOrigin(origin, expectedOrigin, challengeAuditContext);
 
   if (!isoBase64URL.isBase64URL(assertionResponse.authenticatorData)) {
     throw new Error(
@@ -219,7 +490,31 @@ export async function verifyAuthenticationResponse(
     expectedRPIDs = expectedRPID;
   }
 
-  const matchedRPID = await matchExpectedRPID(rpIdHash, expectedRPIDs);
+  const matchedRPID = await matchExpectedRPID(
+    rpIdHash,
+    expectedRPIDs,
+    challengeAuditContext,
+  );
+
+  if (challengeRecord) {
+    assertChallengeResponseContext({
+      record: challengeRecord,
+      ceremony: 'authentication',
+      actualOrigin: origin,
+      actualRPID: matchedRPID,
+      sessionTenant,
+      sessionKey: sessionKeyValue,
+      browserCeremonyID: response.browserCeremonyID,
+      callerExpectedOrigins,
+      callerExpectedRPIDs,
+    });
+    ChallengeContextService.recordConsumption(challenge, {
+      origin,
+      rpID: matchedRPID,
+      tenant: sessionTenant,
+      sessionKey: sessionKeyValue,
+    });
+  }
 
   if (advancedFIDOConfig !== undefined) {
     const { userVerification: fidoUserVerification } = advancedFIDOConfig;
@@ -290,12 +585,84 @@ export async function verifyAuthenticationResponse(
 
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
 
+  const verified = await verifySignature({
+    signature,
+    data: signatureBase,
+    credentialPublicKey: credential.publicKey,
+  });
+
+  /**
+   * A reset/restart, cancellation or newer ceremony that happens while signature verification
+   * is in flight must not publish a session from an older generation. This is the last check
+   * before the success value is returned.
+   */
+  if (challengeRecord) {
+    const currentRecord = ChallengeContextService.getChallenge(challenge);
+    if (
+      ChallengeContextService.generation !== challengeRecord.generation ||
+      !currentRecord ||
+      currentRecord !== challengeRecord ||
+      currentRecord.status !== 'used'
+    ) {
+      const stage: VerificationStage = 'commit';
+      const reason =
+        'Authentication challenge generation changed before the login session could be committed';
+      throw new ChallengeContextError({
+        message: reason,
+        code: 'CHALLENGE_STALE_GENERATION',
+        audit: {
+          ceremony: 'authentication',
+          stage,
+          location:
+            'packages/server/src/authentication/verifyAuthenticationResponse.ts:verifyAuthenticationResponse#commit',
+          reason,
+          actualOrigin: origin,
+          expectedOrigins: challengeRecord.context.origins,
+          callerExpectedOrigins,
+          actualRPID: matchedRPID,
+          expectedRPID: challengeRecord.context.rpID || undefined,
+          callerExpectedRPIDs,
+          tenant: sessionTenant,
+          challengeTenant: challengeRecord.context.tenant,
+          challengeID: challengeRecord.challengeID,
+          ceremonyID: challengeRecord.ceremonyID,
+          browserCeremonyID: response.browserCeremonyID,
+          tabID: response.browserCeremonyID ?? challengeRecord.ceremonyID,
+          ceremonyGeneration: challengeRecord.ceremonyGeneration,
+          generation: challengeRecord.generation,
+          challengeGeneration: challengeRecord.generation,
+          currentGeneration: ChallengeContextService.generation,
+          sessionKey: sessionKeyValue,
+          challengeSessionKey: challengeRecord.sessionKey,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+  }
+
+  let session: VerifiedSessionIdentity | undefined;
+  if (verified && challengeRecord) {
+    ChallengeContextService.recordConsumption(challenge, {
+      credentialID: credential.id,
+      userHandle: assertionResponse.userHandle,
+    });
+    challengeRecord.committedAt = Date.now();
+    session = {
+      origin: clientDataJSON.origin,
+      rpID: matchedRPID,
+      tenant: challengeRecord.context.tenant,
+      sessionKey: challengeRecord.sessionKey,
+      challengeID: challengeRecord.challengeID,
+      ceremonyID: challengeRecord.ceremonyID,
+      browserCeremonyID: response.browserCeremonyID,
+      ceremonyGeneration: challengeRecord.ceremonyGeneration,
+      generation: challengeRecord.generation,
+      challengeGeneration: challengeRecord.generation,
+    };
+  }
+
   const toReturn: VerifiedAuthenticationResponse = {
-    verified: await verifySignature({
-      signature,
-      data: signatureBase,
-      credentialPublicKey: credential.publicKey,
-    }),
+    verified,
     authenticationInfo: {
       newCounter: counter,
       credentialID: credential.id,
@@ -305,6 +672,22 @@ export async function verifyAuthenticationResponse(
       authenticatorExtensionResults: extensionsData,
       origin: clientDataJSON.origin,
       rpID: matchedRPID,
+      ...(challengeRecord && exposeSession
+        ? {
+          challengeID: challengeRecord.challengeID,
+          ceremonyID: challengeRecord.ceremonyID,
+          browserCeremonyID: response.browserCeremonyID,
+          ceremonyGeneration: challengeRecord.ceremonyGeneration,
+          generation: challengeRecord.generation,
+          challengeGeneration: challengeRecord.generation,
+          tenant: challengeRecord.context.tenant,
+          sessionKey: challengeRecord.sessionKey,
+          session,
+          sessionIdentity: session,
+          challengeContext: session,
+          finalSession: session,
+        }
+        : {}),
     },
   };
 
@@ -328,6 +711,8 @@ export async function verifyAuthenticationResponse(
  * reference!**
  * @param authenticationInfo.origin The origin of the website that the authentication occurred on
  * @param authenticationInfo.rpID The RP ID that the authentication occurred on
+ * @param authenticationInfo.session The ceremony/challenge/session identity to use when writing
+ * the final login session. Only present when the challenge was tracked and the signature verified.
  * @param authenticationInfo?.authenticatorExtensionResults The authenticator extensions returned
  * by the browser
  */
@@ -342,5 +727,34 @@ export type VerifiedAuthenticationResponse = {
     origin: string;
     rpID: string;
     authenticatorExtensionResults?: AuthenticationExtensionsAuthenticatorOutputs;
+    /** Tenant frozen into the challenge, when any. */
+    tenant?: string;
+    /** Login-session identity frozen into the challenge, when any. */
+    sessionKey?: string;
+    /** Digest/handle of the consumed challenge. */
+    challengeID?: string;
+    /** Browser/tab ceremony identity that issued the challenge. */
+    ceremonyID?: string;
+    /** Browser/tab identity reported by the client. */
+    browserCeremonyID?: string;
+    /** Ceremony generation that issued the challenge. */
+    ceremonyGeneration?: number;
+    /** Process generation of the consumed challenge. */
+    generation?: number;
+    /** Alias for `generation`. */
+    challengeGeneration?: number;
+    /** Verified identity an RP should use when creating the final login session. */
+    session?: VerifiedSessionIdentity;
+    /** Alias for `session`. */
+    sessionIdentity?: VerifiedSessionIdentity;
+    /** Alias for `session`. */
+    challengeContext?: VerifiedSessionIdentity;
+    /** Alias for `session`. */
+    finalSession?: VerifiedSessionIdentity;
   };
 };
+
+/** Identity an RP should use when creating a login session after authentication. */
+export type VerifiedAuthenticationSessionIdentity = VerifiedSessionIdentity;
+/** Alias for {@link VerifiedAuthenticationSessionIdentity}. */
+export type AuthenticationSessionIdentity = VerifiedAuthenticationSessionIdentity;

@@ -80,6 +80,25 @@ export interface PublicKeyCredentialCreationOptionsJSON {
   attestation?: AttestationConveyancePreference;
   attestationFormats?: AttestationFormat[];
   extensions?: AuthenticationExtensionsClientInputs;
+  /** Ceremony/tab identity when the RP is tracking ceremony generations. */
+  ceremonyID?: string;
+  /** Generation of the ceremony that issued this challenge. */
+  ceremonyGeneration?: number;
+  /** Audit-friendly challenge handle. */
+  challengeID?: string;
+  /** Aggregated ceremony metadata. */
+  ceremony?: CeremonyJSON;
+}
+
+/**
+ * Ceremony metadata that can travel with WebAuthn options and responses without changing the
+ * native WebAuthn structures.
+ */
+export interface CeremonyJSON {
+  id?: string;
+  generation?: number;
+  challengeID?: string;
+  sessionKey?: string;
 }
 
 /**
@@ -94,6 +113,14 @@ export interface PublicKeyCredentialRequestOptionsJSON {
   userVerification?: UserVerificationRequirement;
   hints?: PublicKeyCredentialHint[];
   extensions?: AuthenticationExtensionsClientInputs;
+  /** Ceremony/tab identity when the RP is tracking ceremony generations. */
+  ceremonyID?: string;
+  /** Generation of the ceremony that issued this challenge. */
+  ceremonyGeneration?: number;
+  /** Audit-friendly challenge handle. */
+  challengeID?: string;
+  /** Aggregated ceremony metadata. */
+  ceremony?: CeremonyJSON;
 }
 
 /**
@@ -125,6 +152,20 @@ export interface RegistrationResponseJSON {
   authenticatorAttachment?: AuthenticatorAttachment;
   clientExtensionResults: AuthenticationExtensionsClientOutputs;
   type: PublicKeyCredentialType;
+  /** Browser/tab ceremony identity. */
+  ceremonyID?: string;
+  /** Browser ceremony generation. */
+  ceremonyGeneration?: number;
+  /** Browser/tab identity before any server-issued ceremony metadata is applied. */
+  browserCeremonyID?: string;
+  /** Local browser ceremony generation. */
+  browserCeremonyGeneration?: number;
+  /** Ceremony generation issued by the server, when known. */
+  serverCeremonyGeneration?: number;
+  /** Audit-friendly challenge handle. */
+  challengeID?: string;
+  /** Aggregated ceremony metadata. */
+  ceremony?: CeremonyJSON;
 }
 
 /**
@@ -147,6 +188,20 @@ export interface AuthenticationResponseJSON {
   authenticatorAttachment?: AuthenticatorAttachment;
   clientExtensionResults: AuthenticationExtensionsClientOutputs;
   type: PublicKeyCredentialType;
+  /** Browser/tab ceremony identity. */
+  ceremonyID?: string;
+  /** Generation of the browser ceremony that produced this response. */
+  ceremonyGeneration?: number;
+  /** Browser/tab identity before any server-issued ceremony metadata is applied. */
+  browserCeremonyID?: string;
+  /** Local browser ceremony generation. */
+  browserCeremonyGeneration?: number;
+  /** Generation issued by the server, when known. */
+  serverCeremonyGeneration?: number;
+  /** Audit-friendly challenge handle. */
+  challengeID?: string;
+  /** Aggregated ceremony metadata. */
+  ceremony?: CeremonyJSON;
 }
 
 /**

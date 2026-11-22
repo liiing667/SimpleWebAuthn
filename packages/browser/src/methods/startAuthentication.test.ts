@@ -276,9 +276,85 @@ describe('Method: startAuthentication()', () => {
     const abortSpy = spy(AbortController.prototype, 'abort');
 
     // Fire off a request and immediately attempt a second one
-    startAuthentication({ optionsJSON: goodOpts1 });
+    // The first ceremony is expected to reject as stale; handle it so the test observes the
+    // cancellation behavior without leaving an unhandled rejection.
+    startAuthentication({ optionsJSON: goodOpts1 }).catch(() => {});
     await startAuthentication({ optionsJSON: goodOpts1 });
     assertSpyCalls(abortSpy, 1);
+  });
+
+  it('should reject a result that resolves after another ceremony starts', async () => {
+    let resolveFirst: ((value: unknown) => void) | undefined;
+    const firstResult = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const validCredential = {
+      id: 'foobar',
+      rawId: new Uint8Array([0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]),
+      response: {
+        authenticatorData: new Uint8Array([1, 2, 3, 4]),
+        clientDataJSON: new Uint8Array([5, 6, 7, 8]),
+        signature: new Uint8Array([9, 0, 1, 2]),
+      },
+      getClientExtensionResults: () => ({}),
+      type: 'public-key',
+      authenticatorAttachment: '',
+    };
+
+    let getCallCount = 0;
+    // @ts-ignore: Stub credman for the race
+    globalThis.navigator.credentials.get = () => {
+      getCallCount += 1;
+      return getCallCount === 1 ? firstResult : Promise.resolve(validCredential);
+    };
+
+    const firstCeremony = startAuthentication({ optionsJSON: goodOpts1 });
+    await startAuthentication({ optionsJSON: goodOpts1 });
+
+    resolveFirst!(validCredential);
+
+    const error = await assertRejects(
+      () => firstCeremony,
+      WebAuthnError,
+    );
+    assertEquals((error as WebAuthnError).code, 'ERROR_CEREMONY_ABORTED');
+  });
+
+  it('should return the server ceremony metadata with the response', async () => {
+    globalThis.navigator.credentials.get = async () => ({
+      id: 'foobar',
+      rawId: new Uint8Array([0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]),
+      response: {
+        authenticatorData: new Uint8Array([1, 2, 3, 4]),
+        clientDataJSON: new Uint8Array([5, 6, 7, 8]),
+        signature: new Uint8Array([9, 0, 1, 2]),
+      },
+      getClientExtensionResults: () => ({}),
+      type: 'public-key',
+    });
+
+    const response = await startAuthentication({
+      optionsJSON: {
+        ...goodOpts1,
+        ceremonyID: 'tab-abc',
+        ceremonyGeneration: 42,
+        challengeID: 'challenge-handle',
+        ceremony: {
+          id: 'tab-abc',
+          generation: 42,
+          challengeID: 'challenge-handle',
+          sessionKey: 'login-session',
+        },
+      },
+    });
+
+    assertEquals(response.ceremonyID, 'tab-abc');
+    assertEquals(response.ceremonyGeneration, 42);
+    assertEquals(response.serverCeremonyGeneration, 42);
+    assertEquals(response.challengeID, 'challenge-handle');
+    assertEquals(response.ceremony?.sessionKey, 'login-session');
+    assert(response.browserCeremonyGeneration! > 0);
   });
 
   it('should set up autofill a.k.a. Conditional UI', async () => {

@@ -13,6 +13,7 @@ import { toPublicKeyCredentialDescriptor } from '../helpers/toPublicKeyCredentia
 import { identifyAuthenticationError } from '../helpers/identifyAuthenticationError.ts';
 import { WebAuthnAbortService } from '../helpers/webAuthnAbortService.ts';
 import { toAuthenticatorAttachment } from '../helpers/toAuthenticatorAttachment.ts';
+import { WebAuthnError } from '../helpers/webAuthnError.ts';
 
 export type StartAuthenticationOpts = Parameters<typeof startAuthentication>[0];
 
@@ -46,6 +47,18 @@ export async function startAuthentication(
     verifyBrowserAutofillInput = true,
   } = options;
 
+  const {
+    ceremonyID: optionCeremonyID,
+    ceremonyGeneration: optionCeremonyGeneration,
+    challengeID: optionChallengeID,
+    ceremony: optionCeremony,
+    ...browserOptionsJSON
+  } = optionsJSON;
+  const hasCeremonyMetadata = optionCeremonyID !== undefined ||
+    optionCeremonyGeneration !== undefined ||
+    optionChallengeID !== undefined ||
+    optionCeremony !== undefined;
+
   if (!browserSupportsWebAuthn()) {
     throw new Error('WebAuthn is not supported in this browser');
   }
@@ -61,8 +74,8 @@ export async function startAuthentication(
 
   // We need to convert some values to Uint8Arrays before passing the credentials to the navigator
   const publicKey: PublicKeyCredentialRequestOptions = {
-    ...optionsJSON,
-    challenge: base64URLStringToBuffer(optionsJSON.challenge),
+    ...browserOptionsJSON,
+    challenge: base64URLStringToBuffer(browserOptionsJSON.challenge),
     allowCredentials,
   };
 
@@ -100,7 +113,13 @@ export async function startAuthentication(
   // Finalize options
   getOptions.publicKey = publicKey;
   // Set up the ability to cancel this request if the user attempts another
-  getOptions.signal = WebAuthnAbortService.createNewAbortSignal();
+  const abortSignal = WebAuthnAbortService.createNewAbortSignal();
+  const ceremony = WebAuthnAbortService.getCeremonyState(abortSignal) ?? {
+    signal: abortSignal,
+    generation: WebAuthnAbortService.generation,
+    ceremonyID: WebAuthnAbortService.ceremonyID,
+  };
+  getOptions.signal = abortSignal;
 
   // Wait for the user to complete assertion
   let credential;
@@ -111,6 +130,30 @@ export async function startAuthentication(
     )) as AuthenticationCredential;
   } catch (err) {
     throw identifyAuthenticationError({ error: err as Error, options: getOptions });
+  }
+
+  /**
+   * A browser can resolve an assertion at the same moment another ceremony starts or the current
+   * one is cancelled. The result belongs to the old ceremony and must never be returned to the
+   * caller's newer session.
+   */
+  if (!WebAuthnAbortService.isCurrentCeremony(ceremony.signal, ceremony.generation)) {
+    const abortError = new Error(
+      'Authentication ceremony was superseded or cancelled before its result could be used',
+    );
+    abortError.name = 'AbortError';
+    const identified = identifyAuthenticationError({
+      error: abortError,
+      options: getOptions,
+    });
+    if (identified instanceof WebAuthnError) {
+      throw identified;
+    }
+    throw new WebAuthnError({
+      message: 'Authentication ceremony was sent an abort signal',
+      code: 'ERROR_CEREMONY_ABORTED',
+      cause: abortError,
+    });
   }
 
   if (!credential) {
@@ -139,5 +182,31 @@ export async function startAuthentication(
     authenticatorAttachment: toAuthenticatorAttachment(
       credential.authenticatorAttachment,
     ),
+    ...(hasCeremonyMetadata
+      ? {
+        ceremonyID: optionCeremonyID ?? optionCeremony?.id ?? ceremony.ceremonyID,
+        ceremonyGeneration: optionCeremonyGeneration ??
+          optionCeremony?.generation ?? ceremony.generation,
+        browserCeremonyID: ceremony.ceremonyID,
+        browserCeremonyGeneration: ceremony.generation,
+        ...(optionCeremonyGeneration !== undefined ||
+            optionCeremony?.generation !== undefined
+          ? {
+            serverCeremonyGeneration: optionCeremonyGeneration ??
+              optionCeremony?.generation,
+          }
+          : {}),
+        ...(optionChallengeID || optionCeremony?.challengeID
+          ? { challengeID: optionChallengeID ?? optionCeremony?.challengeID }
+          : {}),
+        ceremony: {
+          id: optionCeremonyID ?? optionCeremony?.id ?? ceremony.ceremonyID,
+          generation: optionCeremonyGeneration ?? optionCeremony?.generation ??
+            ceremony.generation,
+          challengeID: optionChallengeID ?? optionCeremony?.challengeID,
+          sessionKey: optionCeremony?.sessionKey,
+        },
+      }
+      : {}),
   };
 }

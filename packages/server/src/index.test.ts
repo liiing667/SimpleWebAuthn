@@ -29,3 +29,11 @@ Deno.test('should export service `ConvenienceMetadataService`', () => {
 Deno.test('should export service `SettingsService`', () => {
   assert(index.SettingsService);
 });
+
+Deno.test('should export service `ChallengeContextService`', () => {
+  assert(index.ChallengeContextService);
+});
+
+Deno.test('should export error `ChallengeContextError`', () => {
+  assert(index.ChallengeContextError);
+});

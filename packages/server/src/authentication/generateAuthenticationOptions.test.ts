@@ -3,6 +3,7 @@ import { assert, assertEquals } from '@std/assert';
 import { isoBase64URL } from '../helpers/iso/index.ts';
 
 import { generateAuthenticationOptions } from './generateAuthenticationOptions.ts';
+import { ChallengeContextService } from '../services/challengeContextService.ts';
 
 const challengeString = 'dG90YWxseXJhbmRvbXZhbHVl';
 const challengeBuffer = isoBase64URL.toBuffer(challengeString);
@@ -146,4 +147,68 @@ Deno.test('should treat string challenges as UTF-8 strings', async () => {
     options.challenge,
     '44GT44KT44Gr44Gh44Gv',
   );
+});
+
+Deno.test('should bind ceremony/session metadata into the challenge', async () => {
+  ChallengeContextService.reset();
+  const options = await generateAuthenticationOptions({
+    rpID,
+    challenge: challengeString,
+    ceremonyContext: {
+      expectedOrigin: 'https://simplewebauthn.dev',
+      sessionKey: 'login-session',
+    },
+  });
+
+  assert(options.ceremonyID);
+  assert(options.ceremonyGeneration);
+  assert(options.challengeID);
+  assertEquals(options.ceremony?.id, options.ceremonyID);
+  assertEquals(options.ceremony?.sessionKey, 'login-session');
+  assert(options.challenge !== challengeString);
+
+  const record = ChallengeContextService.getChallenge(options.challenge);
+  assertEquals(record?.ceremonyID, options.ceremonyID);
+  assertEquals(record?.ceremonyGeneration, options.ceremonyGeneration);
+  assertEquals(record?.sessionKey, 'login-session');
+});
+
+Deno.test('should supersede a previous start in the same login session', async () => {
+  ChallengeContextService.reset();
+  const first = await generateAuthenticationOptions({
+    rpID,
+    challenge: 'firstChallenge',
+    ceremonyContext: {
+      expectedOrigin: 'https://simplewebauthn.dev',
+      sessionKey: 'retry-session',
+    },
+  });
+  const second = await generateAuthenticationOptions({
+    rpID,
+    challenge: 'secondChallenge',
+    ceremonyContext: {
+      expectedOrigin: 'https://simplewebauthn.dev',
+      sessionKey: 'retry-session',
+    },
+  });
+
+  assert(second.ceremonyGeneration! > first.ceremonyGeneration!);
+
+  const stale = ChallengeContextService.consumeChallenge({
+    challenge: first.challenge,
+    ceremony: 'authentication',
+    origin: 'https://simplewebauthn.dev',
+    rpID,
+    sessionKey: 'retry-session',
+  });
+  assertEquals(stale.status, 'cancelled');
+
+  const current = ChallengeContextService.consumeChallenge({
+    challenge: second.challenge,
+    ceremony: 'authentication',
+    origin: 'https://simplewebauthn.dev',
+    rpID,
+    sessionKey: 'retry-session',
+  });
+  assertEquals(current.status, 'available');
 });

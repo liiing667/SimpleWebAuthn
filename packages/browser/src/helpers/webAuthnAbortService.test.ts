@@ -1,4 +1,4 @@
-import { assertEquals, assertInstanceOf, assertNotEquals } from '@std/assert';
+import { assert, assertEquals, assertFalse, assertInstanceOf, assertNotEquals } from '@std/assert';
 import { assertSpyCalls, spy } from '@std/testing/mock';
 
 import { WebAuthnAbortService } from './webAuthnAbortService.ts';
@@ -50,4 +50,30 @@ Deno.test('should cancel active WebAuthn ceremony when manually cancelled', () =
   // Ensure that we don't set up a new AbortController because it's unnecessary to do so
   // @ts-ignore: Ignore the fact that `controller` is private
   assertEquals(WebAuthnAbortService.controller, undefined);
+});
+
+Deno.test('should advance ceremony generation and reject an older signal', () => {
+  const first = WebAuthnAbortService.createNewCeremony();
+  const second = WebAuthnAbortService.createNewCeremony();
+
+  assert(second.generation > first.generation);
+  assertEquals(WebAuthnAbortService.ceremonyID, second.ceremonyID);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(first.signal), false);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(second.signal), true);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(second.signal, second.generation), true);
+});
+
+Deno.test('should keep a cancelled generation from becoming current again', () => {
+  const ceremony = WebAuthnAbortService.createNewCeremony();
+  WebAuthnAbortService.cancelCeremony();
+
+  assertEquals(ceremony.signal.aborted, true);
+  assertFalse(WebAuthnAbortService.isCurrentCeremony(ceremony.signal));
+  assertEquals(WebAuthnAbortService.isCeremonyCancelled(ceremony.generation), true);
+
+  const next = WebAuthnAbortService.createNewCeremony();
+  assert(next.generation > ceremony.generation);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(next.signal), true);
+  assertEquals(WebAuthnAbortService.isCeremonyCancelled(ceremony.generation), true);
+  assertEquals(WebAuthnAbortService.isCeremonyCancelled(next.generation), false);
 });

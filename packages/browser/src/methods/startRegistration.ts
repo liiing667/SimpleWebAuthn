@@ -12,6 +12,7 @@ import { toPublicKeyCredentialDescriptor } from '../helpers/toPublicKeyCredentia
 import { identifyRegistrationError } from '../helpers/identifyRegistrationError.ts';
 import { WebAuthnAbortService } from '../helpers/webAuthnAbortService.ts';
 import { toAuthenticatorAttachment } from '../helpers/toAuthenticatorAttachment.ts';
+import { WebAuthnError } from '../helpers/webAuthnError.ts';
 
 export type StartRegistrationOpts = Parameters<typeof startRegistration>[0];
 
@@ -39,19 +40,31 @@ export async function startRegistration(
 
   const { optionsJSON, useAutoRegister = false } = options;
 
+  const {
+    ceremonyID: optionCeremonyID,
+    ceremonyGeneration: optionCeremonyGeneration,
+    challengeID: optionChallengeID,
+    ceremony: optionCeremony,
+    ...browserOptionsJSON
+  } = optionsJSON;
+  const hasCeremonyMetadata = optionCeremonyID !== undefined ||
+    optionCeremonyGeneration !== undefined ||
+    optionChallengeID !== undefined ||
+    optionCeremony !== undefined;
+
   if (!browserSupportsWebAuthn()) {
     throw new Error('WebAuthn is not supported in this browser');
   }
 
   // We need to convert some values to Uint8Arrays before passing the credentials to the navigator
   const publicKey: PublicKeyCredentialCreationOptions = {
-    ...optionsJSON,
-    challenge: base64URLStringToBuffer(optionsJSON.challenge),
+    ...browserOptionsJSON,
+    challenge: base64URLStringToBuffer(browserOptionsJSON.challenge),
     user: {
-      ...optionsJSON.user,
-      id: base64URLStringToBuffer(optionsJSON.user.id),
+      ...browserOptionsJSON.user,
+      id: base64URLStringToBuffer(browserOptionsJSON.user.id),
     },
-    excludeCredentials: optionsJSON.excludeCredentials?.map(
+    excludeCredentials: browserOptionsJSON.excludeCredentials?.map(
       toPublicKeyCredentialDescriptor,
     ),
   };
@@ -72,7 +85,13 @@ export async function startRegistration(
   // Finalize options
   createOptions.publicKey = publicKey;
   // Set up the ability to cancel this request if the user attempts another
-  createOptions.signal = WebAuthnAbortService.createNewAbortSignal();
+  const abortSignal = WebAuthnAbortService.createNewAbortSignal();
+  const ceremony = WebAuthnAbortService.getCeremonyState(abortSignal) ?? {
+    signal: abortSignal,
+    generation: WebAuthnAbortService.generation,
+    ceremonyID: WebAuthnAbortService.ceremonyID,
+  };
+  createOptions.signal = abortSignal;
 
   // Wait for the user to complete attestation
   let credential;
@@ -83,6 +102,29 @@ export async function startRegistration(
     )) as RegistrationCredential;
   } catch (err) {
     throw identifyRegistrationError({ error: err as Error, options: createOptions });
+  }
+
+  /**
+   * As with authentication, a stale registration result must not be delivered to a newer
+   * ceremony after the original one was superseded or cancelled.
+   */
+  if (!WebAuthnAbortService.isCurrentCeremony(ceremony.signal, ceremony.generation)) {
+    const abortError = new Error(
+      'Registration ceremony was superseded or cancelled before its result could be used',
+    );
+    abortError.name = 'AbortError';
+    const identified = identifyRegistrationError({
+      error: abortError,
+      options: createOptions,
+    });
+    if (identified instanceof WebAuthnError) {
+      throw identified;
+    }
+    throw new WebAuthnError({
+      message: 'Registration ceremony was sent an abort signal',
+      code: 'ERROR_CEREMONY_ABORTED',
+      cause: abortError,
+    });
   }
 
   if (!credential) {
@@ -147,6 +189,32 @@ export async function startRegistration(
     authenticatorAttachment: toAuthenticatorAttachment(
       credential.authenticatorAttachment,
     ),
+    ...(hasCeremonyMetadata
+      ? {
+        ceremonyID: optionCeremonyID ?? optionCeremony?.id ?? ceremony.ceremonyID,
+        ceremonyGeneration: optionCeremonyGeneration ??
+          optionCeremony?.generation ?? ceremony.generation,
+        browserCeremonyID: ceremony.ceremonyID,
+        browserCeremonyGeneration: ceremony.generation,
+        ...(optionCeremonyGeneration !== undefined ||
+            optionCeremony?.generation !== undefined
+          ? {
+            serverCeremonyGeneration: optionCeremonyGeneration ??
+              optionCeremony?.generation,
+          }
+          : {}),
+        ...(optionChallengeID || optionCeremony?.challengeID
+          ? { challengeID: optionChallengeID ?? optionCeremony?.challengeID }
+          : {}),
+        ceremony: {
+          id: optionCeremonyID ?? optionCeremony?.id ?? ceremony.ceremonyID,
+          generation: optionCeremonyGeneration ?? optionCeremony?.generation ??
+            ceremony.generation,
+          challengeID: optionChallengeID ?? optionCeremony?.challengeID,
+          sessionKey: optionCeremony?.sessionKey,
+        },
+      }
+      : {}),
   };
 }
 

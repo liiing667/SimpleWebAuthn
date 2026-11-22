@@ -10,6 +10,8 @@ export * from './getCertificateInfo.ts';
 export * from './isCertRevoked.ts';
 export * from './parseAuthenticatorData.ts';
 export * from './toHash.ts';
+export * from './canonicalizeOrigin.ts';
+export * from './ceremonyVerification.ts';
 export * from './validateCertificatePath.ts';
 export * from './verifySignature.ts';
 export * from './iso/index.ts';
