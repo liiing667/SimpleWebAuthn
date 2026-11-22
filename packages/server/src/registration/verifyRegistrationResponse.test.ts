@@ -23,6 +23,7 @@ import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
+import type { MetadataStatement } from '../metadata/mdsTypes.ts';
 import { SimpleWebAuthnError } from '../errors/index.ts';
 
 /**
@@ -1044,6 +1045,46 @@ Deno.test('should prefer MDS over Convenience MDS for passkey provider metadata'
   assertEquals(verification.registrationInfo?.passkeyProviderMetadata, mdsMetadata);
   // There's no need to consult Convenience MDS when MDS already had an answer
   assertSpyCalls(mockGetConvenienceProviderMetadata, 0);
+});
+
+Deno.test('should use the metadata statement that verified the attestation for provider metadata', async () => {
+  const statement = {
+    aaguid: '6d44ba9b-f6ec-2e49-b930-0c8fe920cb73',
+    authenticationAlgorithms: ['secp256r1_ecdsa_sha256_raw'],
+    attestationTypes: ['basic_full'],
+    attestationRootCertificates: [],
+    friendlyNames: { en: 'Statement Used For Verification' },
+  } as unknown as MetadataStatement;
+
+  using _mockGetStatement = stub(
+    MetadataService,
+    'getStatement',
+    resolvesNext([statement]),
+  );
+  using mockGetProviderMetadata = stub(
+    MetadataService,
+    'getProviderMetadata',
+    resolvesNext([{ friendlyNames: { en: 'Different Generation' } }]),
+  );
+
+  const verification = await verifyRegistrationResponse({
+    response: attestationPackedX5C,
+    expectedChallenge: attestationPackedX5CChallenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(
+    verification.registrationInfo?.aaguid,
+    '6d44ba9b-f6ec-2e49-b930-0c8fe920cb73',
+  );
+  assertEquals(
+    verification.registrationInfo?.passkeyProviderMetadata?.friendlyNames,
+    { en: 'Statement Used For Verification' },
+  );
+  assertSpyCalls(mockGetProviderMetadata, 0);
 });
 
 Deno.test('should return authenticator extension output', async () => {

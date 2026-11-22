@@ -1,4 +1,6 @@
 import { convertAAGUIDToString } from '../helpers/convertAAGUIDToString.ts';
+import { areAAGUIDsEqual } from '../helpers/aaguid.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
 import type { MetadataBLOBPayloadEntry, MetadataStatement } from '../metadata/mdsTypes.ts';
 import { verifyMDSBlob } from '../metadata/verifyMDSBlob.ts';
 import type { SimpleWebAuthnLogger } from '../helpers/logging.ts';
@@ -149,6 +151,13 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
       return;
     }
 
+    /**
+     * A cache entry is only usable if every identity inside it agrees with the AAGUID that was
+     * looked up. Checking this again at lookup time fails closed for entries injected into the
+     * cache (or produced by an older BLOB) where the entry key and the statement disagree.
+     */
+    this.assertMetadataEntryIdentity(aaguid, entry);
+
     // Check to see if the this aaguid has a status report with a "compromised" status
     for (const report of entry.statusReports) {
       const { status } = report;
@@ -231,13 +240,28 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
       );
     }
 
+    /**
+     * Validate every entry before touching the cache. A BLOB that mixes identities must not be
+     * partially loaded; otherwise a retry could observe metadata from one BLOB generation
+     * alongside roots from another.
+     */
+    const entriesToCache: MetadataBLOBPayloadEntry[] = [];
+    for (const entry of payload.entries) {
+      if (!entry.aaguid) {
+        continue;
+      }
+
+      this.assertMetadataEntryIdentity(entry.aaguid, entry);
+      entriesToCache.push(entry);
+    }
+
     // Remove statements from this server's previous BLOB so statements the server has since
     // dropped don't linger in the cache
     this.metadataCache.clearMetadataByURL(url);
 
     // Cache statements for FIDO2 devices
     let totalEntries = 0;
-    for (const entry of payload.entries) {
+    for (const entry of entriesToCache) {
       totalEntries += this.cacheMetadataBlobEntry(url, entry);
     }
 
@@ -279,9 +303,38 @@ export class BaseMetadataService extends BaseMDSService<MetadataBLOBPayloadEntry
       return 0;
     }
 
+    this.assertMetadataEntryIdentity(entry.aaguid, entry);
     this.metadataCache.cacheMetadata(entry.aaguid, entry, url);
 
     return 1;
+  }
+
+  /**
+   * Ensure that the AAGUID used to cache an entry agrees with the AAGUID in the entry's metadata
+   * statement. Without this check a rotated BLOB could be cached under one identity while its
+   * attestation roots belong to another.
+   */
+  private assertMetadataEntryIdentity(
+    expectedAAGUID: string,
+    entry: MetadataBLOBPayloadEntry,
+  ): void {
+    const entryAAGUID = entry.aaguid;
+    if (entryAAGUID && !areAAGUIDsEqual(entryAAGUID, expectedAAGUID)) {
+      throw new SimpleWebAuthnError({
+        message:
+          `Metadata entry AAGUID "${entryAAGUID}" did not match requested aaguid "${expectedAAGUID}"`,
+        code: 'METADATA_AAGUID_MISMATCH',
+      });
+    }
+
+    const statementAAGUID = entry.metadataStatement?.aaguid;
+    if (statementAAGUID && !areAAGUIDsEqual(statementAAGUID, expectedAAGUID)) {
+      throw new SimpleWebAuthnError({
+        message:
+          `Metadata statement AAGUID "${statementAAGUID}" did not match entry aaguid "${expectedAAGUID}"`,
+        code: 'METADATA_AAGUID_MISMATCH',
+      });
+    }
   }
 }
 

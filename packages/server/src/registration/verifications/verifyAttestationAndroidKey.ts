@@ -25,6 +25,7 @@ export async function verifyAttestationAndroidKey(
     credentialPublicKey,
     aaguid,
     rootCertificates,
+    metadataContext,
   } = options;
   const x5c = attStmt.get('x5c');
   const sig = attStmt.get('sig');
@@ -123,12 +124,17 @@ export async function verifyAttestationAndroidKey(
 
   const statement = await MetadataService.getStatement(aaguid);
   if (statement) {
+    if (metadataContext) {
+      metadataContext.statement = statement;
+    }
+
     try {
       await verifyAttestationWithMetadata({
         statement,
         credentialPublicKey,
         x5c,
         attestationStatementAlg: alg,
+        expectedAAGUID: aaguid,
       });
     } catch (err) {
       const _err = err as Error;

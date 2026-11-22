@@ -6,6 +6,24 @@ import type { MetadataStatement } from '../metadata/mdsTypes.ts';
 import { isoBase64URL } from '../helpers/iso/index.ts';
 import { SimpleWebAuthnError } from '@simplewebauthn/server';
 
+Deno.test('should reject metadata for a different AAGUID than the registration response', async () => {
+  const statement = {
+    aaguid: '11111111-1111-1111-1111-111111111111',
+  } as unknown as MetadataStatement;
+
+  await assertRejects(
+    () =>
+      verifyAttestationWithMetadata({
+        statement,
+        credentialPublicKey: new Uint8Array(),
+        x5c: [],
+        expectedAAGUID: '22222222-2222-2222-2222-222222222222',
+      }),
+    Error,
+    'did not match registration response AAGUID',
+  );
+});
+
 Deno.test('should not verify attestation with revoked certificate in metadata (android-safetynet)', async () => {
   // Faking time to something that'll satisfy all of these ranges:
   // {

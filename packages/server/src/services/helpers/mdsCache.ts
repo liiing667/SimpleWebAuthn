@@ -5,7 +5,7 @@ import type { Uint8Array_ } from '../../types/index.ts';
 // Type aliases to try and convey the type of string value that should be used in the Maps below
 /** A full URL string, including protocol (e.g. `https://example.com`) */
 export type MDSServerURL = string;
-/** A lowercase AAGUID string (e.g. `3add0b21-6513-4323-81a2-74c78f3ea651`) */
+/** An AAGUID string, normalized for cache comparisons (e.g. `3add0b21-6513-4323-81a2-74c78f3ea651`) */
 export type AAGUID = string;
 
 // Cached (C-)MDS APIs from which metadata entries are downloaded
@@ -153,9 +153,11 @@ export class MDSCache<MetadataType> {
   }
 
   /**
-   * Ensure that AAGUIDs are all lowercase before using them as cache keys
+   * Normalize AAGUIDs before using them as cache keys. Both hyphenated UUIDs and 32-character hex
+   * strings identify the same authenticator, and capitalizing one representation differently from
+   * the other must not create a second cache entry (or hide an existing one.)
    */
   private normalizeAAGUID(aaguid: AAGUID): AAGUID {
-    return aaguid.toLowerCase();
+    return aaguid.replaceAll('-', '').toLowerCase();
   }
 }

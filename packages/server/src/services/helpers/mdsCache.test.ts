@@ -48,6 +48,14 @@ describe('Method: cacheMetadata() and getMetadata()', () => {
     assertEquals(cache.count, 1);
   });
 
+  it('should treat hyphenated and non-hyphenated AAGUIDs as the same entry', () => {
+    cache.cacheMetadata(aaguid.replaceAll('-', ''), { name: 'A' }, url);
+
+    assertEquals(cache.getMetadata(aaguid), { name: 'A' });
+    assertEquals(cache.getMetadata(aaguid.replaceAll('-', '')), { name: 'A' });
+    assertEquals(cache.count, 1);
+  });
+
   it('should overwrite an existing entry for the same AAGUID', () => {
     cache.cacheMetadata(aaguid, { name: 'A' }, NonRefreshingURL);
     cache.cacheMetadata(aaguid, { name: 'B' }, url);

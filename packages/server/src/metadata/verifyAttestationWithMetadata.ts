@@ -1,8 +1,13 @@
 import type { Base64URLString } from '../types/index.ts';
 import type { AlgSign, MetadataStatement } from '../metadata/mdsTypes.ts';
+import { AsnParser } from '@peculiar/asn1-schema';
+import { Certificate } from '@peculiar/asn1-x509';
 import { convertCertBufferToPEM } from '../helpers/convertCertBufferToPEM.ts';
+import { convertPEMToBytes } from '../helpers/convertPEMToBytes.ts';
 import { validateCertificatePath } from '../helpers/validateCertificatePath.ts';
 import { decodeCredentialPublicKey } from '../helpers/decodeCredentialPublicKey.ts';
+import { validateExtFIDOGenCEAAGUID } from '../helpers/validateExtFIDOGenCEAAGUID.ts';
+import { areAAGUIDsEqual, convertAAGUIDToBytes } from '../helpers/aaguid.ts';
 import {
   type COSEALG,
   type COSECRV,
@@ -21,17 +26,34 @@ export async function verifyAttestationWithMetadata({
   credentialPublicKey,
   x5c,
   attestationStatementAlg,
+  expectedAAGUID,
 }: {
   statement: MetadataStatement;
   credentialPublicKey: Uint8Array_;
   x5c: Uint8Array_[] | Base64URLString[];
   attestationStatementAlg?: number;
+  /**
+   * AAGUID from the registration response's authenticator data. When provided, the metadata
+   * statement and the attestation certificate must identify the same authenticator.
+   */
+  expectedAAGUID?: Uint8Array_ | string;
 }): Promise<boolean> {
   const {
     authenticationAlgorithms,
     authenticatorGetInfo,
     attestationRootCertificates,
   } = statement;
+
+  /**
+   * Bind the metadata statement to the response that is being verified. This must happen before
+   * any certificate path validation so that roots from a rotated metadata entry cannot be used to
+   * validate a certificate chain for a different authenticator.
+   */
+  if (expectedAAGUID && statement.aaguid && !areAAGUIDsEqual(expectedAAGUID, statement.aaguid)) {
+    throw new Error(
+      `Metadata statement AAGUID "${statement.aaguid}" did not match registration response AAGUID`,
+    );
+  }
 
   // Make sure the alg in the attestation statement matches one of the ones specified in metadata
   const keypairCOSEAlgs: Set<COSEInfo> = new Set();
@@ -148,6 +170,24 @@ export async function verifyAttestationWithMetadata({
   const statementRootCerts = attestationRootCertificates.map(
     convertCertBufferToPEM,
   );
+
+  /**
+   * When the leaf certificate identifies its authenticator with the id-fido-gen-ce-aaguid
+   * extension, require that identity to agree with the metadata statement and/or the registration
+   * response. Some formats also check this in their own verifier, but doing it here keeps the
+   * certificate chain, metadata entry and registration response bound together for every format
+   * that uses metadata.
+   */
+  const aaguidToCheck = expectedAAGUID ?? statement.aaguid;
+  if (aaguidToCheck && authenticatorCerts.length > 0) {
+    const leafCertBytes = convertPEMToBytes(authenticatorCerts[0]);
+    const parsedCertificate = AsnParser.parse(leafCertBytes, Certificate);
+
+    validateExtFIDOGenCEAAGUID(
+      parsedCertificate.tbsCertificate.extensions,
+      convertAAGUIDToBytes(aaguidToCheck),
+    );
+  }
 
   /**
    * If an authenticator returns exactly one certificate in its x5c, and that cert is found in the

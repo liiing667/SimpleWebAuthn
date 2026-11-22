@@ -24,6 +24,7 @@ import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
+import type { MetadataStatement } from '../metadata/mdsTypes.ts';
 
 import { getDefaultSupportedAlgorithmIDs } from './generateRegistrationOptions.ts';
 import { verifyAttestationFIDOU2F } from './verifications/verifyAttestationFIDOU2F.ts';
@@ -237,6 +238,12 @@ export async function verifyRegistrationResponse(
 
   const clientDataHash = await toHash(isoBase64URL.toBuffer(attestationResponse.clientDataJSON));
   const rootCertificates = SettingsService.getRootCertificates({ identifier: fmt });
+  /**
+   * Verifiers that use MDS attach the exact statement they used here. Provider metadata is then
+   * read from that same statement instead of performing a second lookup that could observe a
+   * different metadata generation after a root rotation.
+   */
+  const metadataContext: AttestationMetadataContext = {};
 
   // Prepare arguments to pass to the relevant verification method
   const verifierOpts: AttestationFormatVerifierOpts = {
@@ -249,6 +256,7 @@ export async function verifyRegistrationResponse(
     rootCertificates,
     rpIdHash,
     attestationSafetyNetEnforceCTSCheck,
+    metadataContext,
   };
 
   /**
@@ -283,9 +291,15 @@ export async function verifyRegistrationResponse(
 
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
   const formattedAAGUID = convertAAGUIDToString(aaguid);
-  // Try to pull provider metadata from either MDS service,
-  const providerMetadata = await MetadataService.getProviderMetadata(formattedAAGUID) ??
-    await ConvenienceMetadataService.getProviderMetadata(formattedAAGUID);
+  /**
+   * Prefer the metadata statement that was actually used to verify the attestation certificate
+   * chain. Falling back to a second lookup preserves passkey provider metadata for attestation
+   * formats that do not consult MDS (none, fido-u2f, apple, and self attestation.)
+   */
+  const providerMetadata = metadataContext.statement
+    ? providerMetadataFromStatement(metadataContext.statement)
+    : await MetadataService.getProviderMetadata(formattedAAGUID) ??
+      await ConvenienceMetadataService.getProviderMetadata(formattedAAGUID);
 
   return {
     verified: true,
@@ -363,6 +377,15 @@ export type VerifiedRegistrationResponse = {
 };
 
 /**
+ * Metadata discovered while a verifier is validating an attestation. The statement is carried
+ * through to the registration result so the certificate chain, MDS entry and returned registration
+ * info all describe the same authenticated identity.
+ */
+export type AttestationMetadataContext = {
+  statement?: MetadataStatement;
+};
+
+/**
  * Values passed to all attestation format verifiers, from which they are free to use as they please
  */
 export type AttestationFormatVerifierOpts = {
@@ -376,4 +399,18 @@ export type AttestationFormatVerifierOpts = {
   rpIdHash: Uint8Array_;
   verifyTimestampMS?: boolean;
   attestationSafetyNetEnforceCTSCheck?: boolean;
+  metadataContext?: AttestationMetadataContext;
 };
+
+/**
+ * Extract the subset of a metadata statement exposed as passkey provider metadata.
+ */
+function providerMetadataFromStatement(statement: MetadataStatement): ProviderMetadata {
+  return {
+    friendlyNames: statement.friendlyNames,
+    icon: statement.icon,
+    iconDark: statement.iconDark,
+    providerLogoDark: statement.providerLogoDark,
+    providerLogoLight: statement.providerLogoLight,
+  };
+}

@@ -43,6 +43,7 @@ export async function verifyAttestationTPM(
     credentialPublicKey,
     clientDataHash,
     rootCertificates,
+    metadataContext,
   } = options;
   const ver = attStmt.get('ver');
   const sig = attStmt.get('sig');
@@ -359,12 +360,17 @@ export async function verifyAttestationTPM(
   // Run some metadata checks if a statement exists for this authenticator
   const statement = await MetadataService.getStatement(aaguid);
   if (statement) {
+    if (metadataContext) {
+      metadataContext.statement = statement;
+    }
+
     try {
       await verifyAttestationWithMetadata({
         statement,
         credentialPublicKey,
         x5c,
         attestationStatementAlg: alg,
+        expectedAAGUID: aaguid,
       });
     } catch (err) {
       const _err = err as Error;

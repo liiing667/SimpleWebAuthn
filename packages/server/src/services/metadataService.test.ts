@@ -17,6 +17,8 @@ import { generateLeafCert, generateRootCert } from '../helpers/tests/x509Utils.t
 
 import { BaseMetadataService, MetadataService } from './metadataService.ts';
 import { SettingsService } from './settingsService.ts';
+import { NonRefreshingURL } from './helpers/mdsCache.ts';
+import { SimpleWebAuthnError } from '../errors/index.ts';
 import type { MetadataStatement } from '../metadata/mdsTypes.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
 
@@ -103,6 +105,40 @@ describe('Method: getStatement()', () => {
     const statement = await MetadataService.getStatement('not-a-real-aaguid');
 
     assertEquals(statement, undefined);
+  });
+
+  it('should reject a cached entry whose AAGUID disagrees with its metadata statement', async () => {
+    class TestableMetadataService extends BaseMetadataService {
+      cacheEntry(aaguid: string, statement: MetadataStatement): void {
+        this.metadataCache.cacheMetadata(
+          aaguid,
+          {
+            aaguid,
+            metadataStatement: statement,
+            statusReports: [],
+            timeOfLastStatusChange: '1970-01-01',
+          },
+          NonRefreshingURL,
+        );
+      }
+    }
+
+    const service = new TestableMetadataService();
+    await service.initialize({ mdsServers: [] });
+    service.cacheEntry(
+      '11111111-1111-1111-1111-111111111111',
+      {
+        ...localStatement,
+        aaguid: '22222222-2222-2222-2222-222222222222',
+      },
+    );
+
+    const error = await assertRejects(
+      () => service.getStatement('11111111-1111-1111-1111-111111111111'),
+      SimpleWebAuthnError,
+    );
+
+    assertEquals(error.code, 'METADATA_AAGUID_MISMATCH');
   });
 });
 

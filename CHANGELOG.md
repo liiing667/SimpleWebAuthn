@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** Attestation verification now keeps the registration response AAGUID, the matching
+  MDS entry, and the attestation certificate chain tied to the same authenticator identity across
+  metadata root rotations. Metadata BLOBs are validated as a unit before their cache entries are
+  replaced, and passkey provider metadata is read from the same statement used to verify the
+  certificate chain
+
 ## v14.1.0
 
 **Changes:**
