@@ -9,10 +9,19 @@ interface WebAuthnAbortService {
    * Manually cancel any active WebAuthn registration or authentication attempt.
    */
   cancelCeremony(): void;
+  /**
+   * Check whether the given signal still belongs to the active ceremony.
+   *
+   * A WebAuthn ceremony can resolve at the same time that a page starts another ceremony or
+   * cancels the current one. Callers should check this after `navigator.credentials.create()` or
+   * `.get()` resolves so a stale result is never returned to a newer page/tenant.
+   */
+  isCurrentCeremony(signal: AbortSignal): boolean;
 }
 
 class BaseWebAuthnAbortService implements WebAuthnAbortService {
   private controller: AbortController | undefined;
+  private signal: AbortSignal | undefined;
 
   createNewAbortSignal(): AbortSignal {
     // Abort any existing calls to navigator.credentials.create() or navigator.credentials.get()
@@ -27,6 +36,7 @@ class BaseWebAuthnAbortService implements WebAuthnAbortService {
     const newController = new AbortController();
 
     this.controller = newController;
+    this.signal = newController.signal;
     return newController.signal;
   }
 
@@ -39,7 +49,12 @@ class BaseWebAuthnAbortService implements WebAuthnAbortService {
       this.controller.abort(abortError);
 
       this.controller = undefined;
+      this.signal = undefined;
     }
+  }
+
+  isCurrentCeremony(signal: AbortSignal): boolean {
+    return this.signal === signal && !signal.aborted;
   }
 }
 

@@ -9,6 +9,7 @@ import {
 import { returnsNext, stub } from '@std/testing/mock';
 
 import { verifyAuthenticationResponse } from './verifyAuthenticationResponse.ts';
+import { generateAuthenticationOptions } from './generateAuthenticationOptions.ts';
 
 import type { AuthenticationResponseJSON, WebAuthnCredential } from '../types/index.ts';
 import { _decodeClientDataJSONInternals } from '../helpers/decodeClientDataJSON.ts';
@@ -19,7 +20,12 @@ import {
 import { toHash } from '../helpers/toHash.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { denoSupportsPQC } from '../helpers/tests/index.ts';
-import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
+import {
+  ChallengeContextError,
+  PQCNotSupportedError,
+  SimpleWebAuthnError,
+} from '../errors/index.ts';
+import { ChallengeContextService } from '../services/challengeContextService.ts';
 
 Deno.test('should verify an assertion response', async () => {
   const verification = await verifyAuthenticationResponse({
@@ -1078,3 +1084,306 @@ const authenticatorFirstTimeUsed: WebAuthnCredential = {
   id: 'wSisR0_4hlzw3Y1tj4uNwwifIhRa-ZxWJwWbnfror0pVK9qPdBPO5pW3gasPqn6wXHb0LNhXB_IrA1nFoSQJ9A',
   counter: 0,
 };
+
+Deno.test('should publish a verified session bound to the challenge tenant', async () => {
+  ChallengeContextService.reset();
+
+  const challenge = assertionChallenge;
+  ChallengeContextService.rememberChallenge({
+    challenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: challenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo.tenant, 'tenant-a');
+  assertEquals(verification.authenticationInfo.session?.origin, assertionOrigin);
+  assertEquals(verification.authenticationInfo.session?.rpID, 'dev.dontneeda.pw');
+  assertEquals(verification.authenticationInfo.session?.tenant, 'tenant-a');
+  assertEquals(verification.authenticationInfo.finalSession?.tenant, 'tenant-a');
+  assertExists(verification.authenticationInfo.session?.challengeID);
+  assertEquals(
+    verification.authenticationInfo.session?.generation,
+    ChallengeContextService.generation,
+  );
+});
+
+Deno.test('should reject an authentication response presented to another tenant', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-b',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'tenant');
+  assertEquals(audit.actualOrigin, assertionOrigin);
+  assertEquals(audit.actualRPID, 'dev.dontneeda.pw');
+  assertEquals(audit.tenant, 'tenant-b');
+  assertEquals(audit.challengeTenant, 'tenant-a');
+  assert(audit.location.includes('challengeVerification'));
+});
+
+Deno.test('should reject a valid response issued for another origin even in multi-origin config', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: ['https://tenant-a.example.com'],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        // The caller accepts both tenant origins, but the challenge was frozen for tenant A only
+        expectedOrigin: ['https://tenant-a.example.com', assertionOrigin],
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-a',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'origin');
+  assertEquals(audit.actualOrigin, assertionOrigin);
+  assertEquals(audit.actualRPID, 'dev.dontneeda.pw');
+  assertEquals(audit.expectedOrigins, ['https://tenant-a.example.com']);
+  assert(audit.location.includes('challengeVerification'));
+});
+
+Deno.test('should allow a legitimate multi-origin challenge', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin, 'https://tenant-b.example.com'],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: [assertionOrigin, 'https://tenant-b.example.com'],
+    expectedRPID: ['dev.dontneeda.pw'],
+    expectedTenant: 'tenant-a',
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo.session?.tenant, 'tenant-a');
+});
+
+Deno.test('should bind a fixture-style response that uses the original custom challenge', async () => {
+  ChallengeContextService.reset();
+
+  const options = await generateAuthenticationOptions({
+    rpID: 'dev.dontneeda.pw',
+    challenge: assertionChallenge,
+    challengeContext: {
+      expectedOrigin: assertionOrigin,
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const verification = await verifyAuthenticationResponse({
+    // `assertionResponse` was captured with the pre-envelope custom challenge value
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo.session?.tenant, 'tenant-a');
+  assertEquals(
+    ChallengeContextService.getChallenge(assertionChallenge)?.challenge,
+    options.challenge,
+  );
+});
+
+Deno.test('should reject a replayed authentication challenge', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    credential,
+    requireUserVerification: false,
+  });
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-a',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'challenge_replay');
+  assert(audit.location.includes('challengeContextService'));
+});
+
+Deno.test('should reject a cancelled authentication challenge', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: assertionChallenge,
+    ceremony: 'authentication',
+    context: {
+      origins: [assertionOrigin],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+  ChallengeContextService.cancelChallenge(assertionChallenge);
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge: assertionChallenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-a',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  assertEquals((error as ChallengeContextError).audit.stage, 'challenge_cancellation');
+});
+
+Deno.test('should not revive a context challenge after a simulated restart', async () => {
+  ChallengeContextService.reset();
+
+  const challenge = await generateAuthenticationOptions({
+    rpID: 'dev.dontneeda.pw',
+    challenge: isoBase64URL.toBuffer(assertionChallenge),
+    challengeContext: {
+      expectedOrigin: assertionOrigin,
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  ChallengeContextService.reset('simulated restart');
+
+  const error = await assertRejects(
+    () =>
+      verifyAuthenticationResponse({
+        response: {
+          ...assertionResponse,
+          response: {
+            ...assertionResponse.response,
+            clientDataJSON: isoBase64URL.fromUTF8String(
+              JSON.stringify({
+                type: 'webauthn.get',
+                challenge: challenge.challenge,
+                origin: assertionOrigin,
+              }),
+            ),
+          },
+        },
+        expectedChallenge: challenge.challenge,
+        expectedOrigin: assertionOrigin,
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-a',
+        credential,
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'challenge_lookup');
+  assertEquals(typeof audit.generation, 'number');
+});
+
+Deno.test('should keep legacy stateless authentication working', async () => {
+  ChallengeContextService.reset();
+
+  const verification = await verifyAuthenticationResponse({
+    response: assertionResponse,
+    expectedChallenge: assertionChallenge,
+    expectedOrigin: assertionOrigin,
+    expectedRPID: 'dev.dontneeda.pw',
+    credential,
+    requireUserVerification: false,
+  });
+
+  assertEquals(verification.verified, true);
+  assertEquals(verification.authenticationInfo.session, undefined);
+});

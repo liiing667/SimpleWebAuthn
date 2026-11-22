@@ -100,7 +100,8 @@ export async function startAuthentication(
   // Finalize options
   getOptions.publicKey = publicKey;
   // Set up the ability to cancel this request if the user attempts another
-  getOptions.signal = WebAuthnAbortService.createNewAbortSignal();
+  const abortSignal = WebAuthnAbortService.createNewAbortSignal();
+  getOptions.signal = abortSignal;
 
   // Wait for the user to complete assertion
   let credential;
@@ -115,6 +116,19 @@ export async function startAuthentication(
 
   if (!credential) {
     throw new Error('Authentication was not completed');
+  }
+
+  /**
+   * A browser can resolve an assertion at the same moment another ceremony starts (for example,
+   * while a client-side router is switching tenants). If that happens, the resolved credential
+   * belongs to the previous ceremony and must never be returned to the caller's new session.
+   */
+  if (!WebAuthnAbortService.isCurrentCeremony(abortSignal)) {
+    const abortError = new Error(
+      'Authentication ceremony was superseded or cancelled before its result could be used',
+    );
+    abortError.name = 'AbortError';
+    throw identifyAuthenticationError({ error: abortError, options: getOptions });
   }
 
   const { id, rawId, response, type } = credential;

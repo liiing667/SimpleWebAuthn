@@ -8,6 +8,7 @@ export enum SERVICE_STATE {
 
 export class ServiceStateTracker {
   private state = SERVICE_STATE.DISABLED;
+  private stateGeneration = 1;
 
   constructor(
     private readonly name: string,
@@ -19,6 +20,50 @@ export class ServiceStateTracker {
    */
   get current(): SERVICE_STATE {
     return this.state;
+  }
+
+  /**
+   * Monotonically increasing generation for the service's current state.
+   *
+   * Services that hand out something which can be consumed later (challenges, cached metadata,
+   * etc.) can stamp that value with the generation in which it was created. After a reset or a
+   * state transition that invalidates the previous generation, consumers can compare the stamp to
+   * this value before publishing anything.
+   */
+  get generation(): number {
+    return this.stateGeneration;
+  }
+
+  /** Alias for `generation` */
+  get currentGeneration(): number {
+    return this.stateGeneration;
+  }
+
+  /**
+   * A snapshot of the state and generation that consumers can store alongside a candidate.
+   */
+  snapshot(): { name: string; state: SERVICE_STATE; generation: number } {
+    return {
+      name: this.name,
+      state: this.state,
+      generation: this.stateGeneration,
+    };
+  }
+
+  /**
+   * Advance the service generation, invalidating any candidates stamped with an older value.
+   *
+   * Returns the new generation so callers can include it in the state they publish.
+   */
+  advanceGeneration(reason?: string): number {
+    this.stateGeneration += 1;
+
+    const reasonSuffix = reason ? `: ${reason}` : '';
+    this.logger.debug(
+      `${this.name} advanced to generation ${this.stateGeneration}${reasonSuffix}`,
+    );
+
+    return this.stateGeneration;
   }
 
   /**

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**Changes:**
+
+- **[server]** `generateRegistrationOptions()` and `generateAuthenticationOptions()` now accept an
+  optional `challengeContext` that freezes the allowed origin(s), RP ID and tenant for the
+  challenge. `verifyRegistrationResponse()` and `verifyAuthenticationResponse()` consume that
+  context exactly once and reject cross-origin, cross-RP-ID, cross-tenant, cancelled, expired and
+  replayed responses. Rejections carry a structured `ChallengeContextError.audit` report containing
+  the actual origin/RP ID/tenant and the exact rejection stage/location. Existing stateless calls
+  and multi-origin configurations keep their previous behavior.
+- **[browser]** `startAuthentication()` and `startRegistration()` now reject a ceremony result that
+  resolves after a newer ceremony has started or after `WebAuthnAbortService.cancelCeremony()`, so a
+  stale result can't be written into a newer page/tenant session.
+
 ## v14.1.0
 
 **Changes:**

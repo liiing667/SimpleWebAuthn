@@ -3,6 +3,7 @@ import { assertSpyCall, assertSpyCalls, resolvesNext, returnsNext, stub } from '
 import { FakeTime } from '@std/testing/time';
 
 import { verifyRegistrationResponse } from './verifyRegistrationResponse.ts';
+import { generateRegistrationOptions } from './generateRegistrationOptions.ts';
 import type { RegistrationResponseJSON } from '../types/index.ts';
 import {
   _decodeAttestationObjectInternals,
@@ -23,7 +24,8 @@ import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
-import { SimpleWebAuthnError } from '../errors/index.ts';
+import { ChallengeContextError, SimpleWebAuthnError } from '../errors/index.ts';
+import { ChallengeContextService } from '../services/challengeContextService.ts';
 
 /**
  * Trust the fake root for android-key since responses were captured from FIDO Conformance testing
@@ -1528,3 +1530,137 @@ const attestationNone: RegistrationResponseJSON = {
 const attestationNoneChallenge = isoBase64URL.fromUTF8String(
   'hEccPWuziP00H0p5gxh2_u5_PC4NeYgd',
 );
+
+Deno.test('should publish a verified registration session bound to the challenge tenant', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: attestationFIDOU2FChallenge,
+    ceremony: 'registration',
+    context: {
+      origins: ['https://dev.dontneeda.pw'],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const verification = await verifyRegistrationResponse({
+    response: attestationFIDOU2F,
+    expectedChallenge: attestationFIDOU2FChallenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.registrationInfo.session?.origin, 'https://dev.dontneeda.pw');
+  assertEquals(verification.registrationInfo.session?.rpID, 'dev.dontneeda.pw');
+  assertEquals(verification.registrationInfo.session?.tenant, 'tenant-a');
+});
+
+Deno.test('should bind a fixture-style registration response that uses the original challenge', async () => {
+  ChallengeContextService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'user@dev.dontneeda.pw',
+    challenge: attestationFIDOU2FChallenge,
+    challengeContext: {
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const verification = await verifyRegistrationResponse({
+    response: attestationFIDOU2F,
+    expectedChallenge: attestationFIDOU2FChallenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    requireUserVerification: false,
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.registrationInfo.session?.tenant, 'tenant-a');
+  assertEquals(
+    ChallengeContextService.getChallenge(attestationFIDOU2FChallenge)?.challenge,
+    options.challenge,
+  );
+});
+
+Deno.test('should reject a registration response presented to another tenant', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: attestationFIDOU2FChallenge,
+    ceremony: 'registration',
+    context: {
+      origins: ['https://dev.dontneeda.pw'],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  const error = await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response: attestationFIDOU2F,
+        expectedChallenge: attestationFIDOU2FChallenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-b',
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  const audit = (error as ChallengeContextError).audit;
+  assertEquals(audit.stage, 'tenant');
+  assertEquals(audit.actualOrigin, 'https://dev.dontneeda.pw');
+  assertEquals(audit.actualRPID, 'dev.dontneeda.pw');
+  assertEquals(audit.tenant, 'tenant-b');
+  assertEquals(audit.challengeTenant, 'tenant-a');
+});
+
+Deno.test('should reject a replayed registration challenge', async () => {
+  ChallengeContextService.reset();
+
+  ChallengeContextService.rememberChallenge({
+    challenge: attestationFIDOU2FChallenge,
+    ceremony: 'registration',
+    context: {
+      origins: ['https://dev.dontneeda.pw'],
+      rpID: 'dev.dontneeda.pw',
+      tenant: 'tenant-a',
+    },
+  });
+
+  await verifyRegistrationResponse({
+    response: attestationFIDOU2F,
+    expectedChallenge: attestationFIDOU2FChallenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedTenant: 'tenant-a',
+    requireUserVerification: false,
+  });
+
+  const error = await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response: attestationFIDOU2F,
+        expectedChallenge: attestationFIDOU2FChallenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedTenant: 'tenant-a',
+        requireUserVerification: false,
+      }),
+    ChallengeContextError,
+  );
+
+  assertEquals((error as ChallengeContextError).audit.stage, 'challenge_replay');
+
+  ChallengeContextService.reset();
+});

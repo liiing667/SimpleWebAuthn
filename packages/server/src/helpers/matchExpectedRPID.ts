@@ -3,6 +3,7 @@ import { isoUint8Array } from './iso/index.ts';
 import type { Uint8Array_ } from '../types/index.ts';
 import { assertValidExpectedRPID } from './assertValidExpectedRPID.ts';
 import { SimpleWebAuthnError } from '../errors/index.ts';
+import type { ChallengeAudit } from '../types/audit.ts';
 
 /**
  * Go through each expected RP ID and try to find one that matches. Returns the unhashed RP ID
@@ -13,6 +14,7 @@ import { SimpleWebAuthnError } from '../errors/index.ts';
 export async function matchExpectedRPID(
   rpIDHash: Uint8Array_,
   expectedRPIDs: string[],
+  auditContext?: Partial<ChallengeAudit>,
 ): Promise<string> {
   for (const rpID of expectedRPIDs) {
     assertValidExpectedRPID(rpID);
@@ -44,10 +46,39 @@ export async function matchExpectedRPID(
       throw new SimpleWebAuthnError({
         message: 'Unexpected RP ID hash',
         code: 'UNEXPECTED_RP_ID',
+        audit: buildRPIDAudit(expectedRPIDs, auditContext),
       });
     }
 
     // An unexpected error occurred
     throw err;
   }
+}
+
+function buildRPIDAudit(
+  expectedRPIDs: string[],
+  auditContext: Partial<ChallengeAudit> | undefined,
+): ChallengeAudit | undefined {
+  if (!auditContext) {
+    return undefined;
+  }
+
+  return {
+    ceremony: auditContext.ceremony ?? 'authentication',
+    stage: 'rp_id',
+    location: 'packages/server/src/helpers/matchExpectedRPID.ts:matchExpectedRPID',
+    reason: 'Unexpected RP ID hash',
+    actualOrigin: auditContext.actualOrigin,
+    expectedOrigins: auditContext.expectedOrigins ?? [],
+    callerExpectedOrigins: auditContext.callerExpectedOrigins,
+    actualRPID: auditContext.actualRPID,
+    expectedRPID: auditContext.expectedRPID,
+    callerExpectedRPIDs: auditContext.callerExpectedRPIDs ?? expectedRPIDs,
+    tenant: auditContext.tenant,
+    challengeTenant: auditContext.challengeTenant,
+    challengeID: auditContext.challengeID,
+    generation: auditContext.generation,
+    currentGeneration: auditContext.currentGeneration,
+    timestamp: new Date().toISOString(),
+  };
 }

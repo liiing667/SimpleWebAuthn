@@ -12,6 +12,11 @@ import { generateChallenge } from '../helpers/generateChallenge.ts';
 import { generateUserID } from '../helpers/generateUserID.ts';
 import { isoBase64URL, isoUint8Array } from '../helpers/iso/index.ts';
 import { COSEALG } from '../helpers/cose.ts';
+import {
+  type ChallengeContextInput,
+  ChallengeContextService,
+  normalizeChallengeContext,
+} from '../services/challengeContextService.ts';
 
 export type GenerateRegistrationOptionsOpts = Parameters<typeof generateRegistrationOptions>[0];
 
@@ -58,6 +63,11 @@ export function getDefaultSupportedAlgorithmIDs(): COSEALG[] {
  * @param extensions **(Optional)** - Additional plugins the authenticator or browser should use during attestation
  * @param supportedAlgorithmIDs **(Optional)** - Array of numeric COSE algorithm identifiers indicating supported public key algorithms. Import `COSEALG` from \@simplewebauthn/server/helpers for suitable values. Defaults to `[COSEALG.EdDSA, COSEALG.ES256, COSEALG.RS256]`
  * @param preferredAuthenticatorType **(Optional)** - Encourage the browser to prompt the user to register a specific type of authenticator
+ * @param challengeContext **(Optional)** - Freeze the origin(s), RP ID and tenant that are allowed
+ * to complete this registration. When provided, `verifyRegistrationResponse()` rejects a response
+ * presented from another origin, RP ID, tenant, or process generation.
+ * @param expectedOrigin **(Optional)** - Convenience alias for `challengeContext.expectedOrigin`
+ * @param tenant **(Optional)** - Convenience alias for `challengeContext.tenant`
  */
 export async function generateRegistrationOptions(
   options: {
@@ -77,6 +87,19 @@ export async function generateRegistrationOptions(
     extensions?: AuthenticationExtensionsClientInputs;
     supportedAlgorithmIDs?: number[];
     preferredAuthenticatorType?: 'securityKey' | 'localDevice' | 'remoteDevice';
+    challengeContext?: ChallengeContextInput;
+    /** Convenience alias for `challengeContext.expectedOrigin` */
+    expectedOrigin?: string | string[];
+    /** Convenience alias for `challengeContext.origin` */
+    origin?: string | string[];
+    /** Convenience alias for `challengeContext.origin` */
+    origins?: string | string[];
+    /** Convenience alias for `challengeContext.tenant` */
+    tenant?: string;
+    /** Convenience alias for `challengeContext.tenant` */
+    tenantID?: string;
+    /** Convenience alias for `challengeContext.tenant` */
+    tenantId?: string;
   },
 ): Promise<PublicKeyCredentialCreationOptionsJSON> {
   const {
@@ -93,6 +116,13 @@ export async function generateRegistrationOptions(
     extensions,
     supportedAlgorithmIDs = getDefaultSupportedAlgorithmIDs(),
     preferredAuthenticatorType,
+    challengeContext,
+    expectedOrigin,
+    origin,
+    origins,
+    tenant,
+    tenantID,
+    tenantId,
   } = options;
 
   /**
@@ -161,6 +191,32 @@ export async function generateRegistrationOptions(
     _userID = await generateUserID();
   }
 
+  let challengeString = isoBase64URL.fromBuffer(_challenge);
+
+  const hasTopLevelContext = expectedOrigin !== undefined ||
+    origin !== undefined ||
+    origins !== undefined ||
+    tenant !== undefined ||
+    tenantID !== undefined ||
+    tenantId !== undefined;
+  const contextInput = challengeContext ??
+    (hasTopLevelContext
+      ? { expectedOrigin, origin, origins, tenant, tenantID, tenantId, rpID }
+      : undefined);
+  const normalizedContext = normalizeChallengeContext(contextInput, rpID);
+  if (normalizedContext) {
+    challengeString = await ChallengeContextService.issueChallenge({
+      ceremony: 'registration',
+      challenge: challengeString,
+      context: {
+        ...normalizedContext,
+        userID: normalizedContext.userID ?? isoBase64URL.fromBuffer(_userID),
+      },
+      timeoutMS: timeout,
+      challengeAliases: typeof challenge === 'string' ? [challenge] : undefined,
+    });
+  }
+
   /**
    * Map authenticator preference to hints. Map to authenticatorAttachment as well for
    * backwards-compatibility.
@@ -180,7 +236,7 @@ export async function generateRegistrationOptions(
   }
 
   return {
-    challenge: isoBase64URL.fromBuffer(_challenge),
+    challenge: challengeString,
     rp: {
       name: rpName,
       id: rpID,

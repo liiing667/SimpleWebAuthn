@@ -206,6 +206,43 @@ describe('Method: startRegistration', () => {
     assertEquals(response.clientExtensionResults, {});
   });
 
+  it('should reject a result that resolves after another ceremony starts', async () => {
+    let resolveFirst: ((value: unknown) => void) | undefined;
+    const firstResult = new Promise((resolve) => {
+      resolveFirst = resolve;
+    });
+
+    const validCredential = {
+      id: 'foobar',
+      rawId: new Uint8Array([0x66, 0x6f, 0x6f, 0x62, 0x61, 0x72]),
+      response: {
+        attestationObject: new Uint8Array([1, 2, 3, 4]),
+        clientDataJSON: new Uint8Array([5, 6, 7, 8]),
+      },
+      getClientExtensionResults: () => ({}),
+      type: 'public-key',
+      authenticatorAttachment: '',
+    };
+
+    let createCallCount = 0;
+    // @ts-ignore: Stub credman for the race
+    globalThis.navigator.credentials.create = () => {
+      createCallCount += 1;
+      return createCallCount === 1 ? firstResult : Promise.resolve(validCredential);
+    };
+
+    const firstCeremony = startRegistration({ optionsJSON: goodOpts1 });
+    await startRegistration({ optionsJSON: goodOpts1 });
+
+    resolveFirst!(validCredential);
+
+    const error = await assertRejects(
+      () => firstCeremony,
+      WebAuthnError,
+    );
+    assertEquals((error as WebAuthnError).code, 'ERROR_CEREMONY_ABORTED');
+  });
+
   it('should support "cable" transport in excludeCredentials', async () => {
     const opts: PublicKeyCredentialCreationOptionsJSON = {
       ...goodOpts1,

@@ -60,6 +60,29 @@ describe('Method: set()', () => {
   });
 });
 
+describe('Property: generation', () => {
+  it('should start at generation 1', () => {
+    assertEquals(tracker.generation, 1);
+  });
+
+  it('should advance monotonically', () => {
+    assertEquals(tracker.advanceGeneration(), 2);
+    assertEquals(tracker.advanceGeneration('refresh'), 3);
+    assertEquals(tracker.generation, 3);
+  });
+
+  it('should include the generation in a snapshot', () => {
+    tracker.set(SERVICE_STATE.REFRESHING);
+    tracker.advanceGeneration();
+
+    assertEquals(tracker.snapshot(), {
+      name: 'TestService',
+      state: SERVICE_STATE.REFRESHING,
+      generation: 2,
+    });
+  });
+});
+
 describe('Method: pauseUntilReady()', () => {
   it('should resolve immediately when already READY', async () => {
     tracker.set(SERVICE_STATE.READY);

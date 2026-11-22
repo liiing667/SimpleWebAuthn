@@ -94,6 +94,11 @@ export let expectedOrigin = '';
  * Here, the example server assumes the following user has completed login:
  */
 const loggedInUserId = 'internalUserId';
+/**
+ * Bind each challenge to the tenant/session that requested it. In a real multi-tenant deployment
+ * this value would come from the request's resolved tenant, not a constant.
+ */
+const exampleTenantID = 'example-tenant';
 
 const inMemoryUserDB: { [loggedInUserId: string]: LoggedInUser } = {
   [loggedInUserId]: {
@@ -147,6 +152,11 @@ app.get('/generate-registration-options', async (req, res) => {
      * Support the two most common algorithms: ES256, and RS256
      */
     supportedAlgorithmIDs: [-7, -257],
+    challengeContext: {
+      expectedOrigin,
+      rpID,
+      tenant: exampleTenantID,
+    },
   };
 
   const options = await generateRegistrationOptions(opts);
@@ -174,6 +184,7 @@ app.post('/verify-registration', async (req, res) => {
       expectedChallenge: `${expectedChallenge}`,
       expectedOrigin,
       expectedRPID: rpID,
+      expectedTenant: exampleTenantID,
       requireUserVerification: false,
     };
     verification = await verifyRegistrationResponse(opts);
@@ -230,6 +241,11 @@ app.get('/generate-authentication-options', async (req, res) => {
      */
     userVerification: 'preferred',
     rpID,
+    challengeContext: {
+      expectedOrigin,
+      rpID,
+      tenant: exampleTenantID,
+    },
   };
 
   const options = await generateAuthenticationOptions(opts);
@@ -272,6 +288,7 @@ app.post('/verify-authentication', async (req, res) => {
       expectedChallenge: `${expectedChallenge}`,
       expectedOrigin,
       expectedRPID: rpID,
+      expectedTenant: exampleTenantID,
       credential: dbCredential,
       requireUserVerification: false,
     };

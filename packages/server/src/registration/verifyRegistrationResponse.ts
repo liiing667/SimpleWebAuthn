@@ -33,6 +33,24 @@ import { verifyAttestationTPM } from './verifications/tpm/verifyAttestationTPM.t
 import { verifyAttestationAndroidKey } from './verifications/verifyAttestationAndroidKey.ts';
 import { verifyAttestationApple } from './verifications/verifyAttestationApple.ts';
 import { matchExpectedOrigin } from '../helpers/matchExpectedOrigin.ts';
+import {
+  ChallengeContextService,
+  type ChallengeContextRecord,
+  type ChallengeConsumption,
+} from '../services/challengeContextService.ts';
+import type {
+  ChallengeAudit,
+  VerificationStage,
+  VerifiedSessionIdentity,
+} from '../types/audit.ts';
+import {
+  asArray,
+  assertChallengeGenerationCurrent,
+  assertChallengeResponseContext,
+  challengeConsumptionError,
+  REGISTRATION_SOURCE,
+  rethrowWithChallengeAudit,
+} from '../helpers/challengeVerification.ts';
 
 /**
  * Configurable options when calling `verifyRegistrationResponse()`
@@ -53,6 +71,11 @@ export type VerifyRegistrationResponseOpts = Parameters<typeof verifyRegistratio
  * @param requireUserVerification **(Optional)** - Enforce user verification by the authenticator (via PIN, fingerprint, etc...) Defaults to `true`
  * @param supportedAlgorithmIDs **(Optional)** - Array of numeric COSE algorithm identifiers indicating supported public key algorithms. Import `COSEALG` from \@simplewebauthn/server/helpers for suitable values. Should be the same value that was specified for this same argument when calling `generateRegistrationOptions()`. Defaults to `[COSEALG.EdDSA, COSEALG.ES256, COSEALG.RS256]`
  * @param attestationSafetyNetEnforceCTSCheck **(Optional)** - Require that an Android device's system integrity has not been tampered with if it uses SafetyNet attestation. Defaults to `true`
+ * @param expectedTenant **(Optional)** - Tenant/account/session identity that is consuming this
+ * registration. Required when the challenge was generated with a `tenant` in its
+ * `challengeContext`.
+ * @param requireChallengeContext **(Optional)** - When `true`, reject caller-managed challenges
+ * that were not issued with a challenge context. Defaults to `false` for backwards compatibility.
  */
 export async function verifyRegistrationResponse(
   options: {
@@ -65,19 +88,62 @@ export async function verifyRegistrationResponse(
     requireUserVerification?: boolean;
     supportedAlgorithmIDs?: number[];
     attestationSafetyNetEnforceCTSCheck?: boolean;
+    expectedTenant?: string;
+    /** Alias for `expectedTenant` */
+    tenant?: string;
+    /** Alias for `expectedTenant` */
+    tenantId?: string;
+    /** Alias for `expectedTenant` */
+    sessionTenant?: string;
+    requireChallengeContext?: boolean;
   },
 ): Promise<VerifiedRegistrationResponse> {
   const {
-    response,
+    response: originalResponse,
     expectedChallenge,
-    expectedOrigin,
-    expectedRPID,
-    expectedType,
+    expectedOrigin: originalExpectedOrigin,
+    expectedRPID: originalExpectedRPID,
+    expectedType: originalExpectedType,
     requireUserPresence = true,
     requireUserVerification = true,
-    supportedAlgorithmIDs = getDefaultSupportedAlgorithmIDs(),
+    supportedAlgorithmIDs: originalSupportedAlgorithmIDs = getDefaultSupportedAlgorithmIDs(),
     attestationSafetyNetEnforceCTSCheck = true,
+    expectedTenant,
+    tenant,
+    tenantId,
+    sessionTenant,
+    requireChallengeContext = false,
   } = options;
+
+  const sessionTenantID = expectedTenant ?? tenant ?? tenantId ?? sessionTenant;
+
+  /**
+   * Freeze the response and caller expectations before any async work. The attestation object,
+   * challenge, origin and supported algorithms all need to describe the same submission when the
+   * registration is finally committed.
+   */
+  const response: RegistrationResponseJSON = {
+    ...originalResponse,
+    response: {
+      ...originalResponse.response,
+      attestationObject: originalResponse.response.attestationObject,
+      clientDataJSON: originalResponse.response.clientDataJSON,
+      transports: originalResponse.response.transports
+        ? [...originalResponse.response.transports]
+        : undefined,
+    },
+  };
+  const expectedOrigin = Array.isArray(originalExpectedOrigin)
+    ? [...originalExpectedOrigin]
+    : originalExpectedOrigin;
+  const expectedRPID = Array.isArray(originalExpectedRPID)
+    ? [...originalExpectedRPID]
+    : originalExpectedRPID;
+  const expectedType = Array.isArray(originalExpectedType)
+    ? [...originalExpectedType]
+    : originalExpectedType;
+  const supportedAlgorithmIDs = [...originalSupportedAlgorithmIDs];
+
   const { id, rawId, type: credentialType, response: attestationResponse } = response;
 
   // Ensure credential specified an ID
@@ -103,193 +169,299 @@ export async function verifyRegistrationResponse(
 
   const { type, origin, challenge, tokenBinding } = clientDataJSON;
 
-  // Make sure we're handling an registration
-  if (Array.isArray(expectedType)) {
-    if (!expectedType.includes(type)) {
-      const joinedExpectedType = expectedType.join(', ');
-      throw new Error(
-        `Unexpected registration response type "${type}", expected one of: ${joinedExpectedType}`,
-      );
-    }
-  } else if (expectedType) {
-    if (type !== expectedType) {
-      throw new Error(
-        `Unexpected registration response type "${type}", expected "${expectedType}"`,
-      );
-    }
-  } else if (type !== 'webauthn.create') {
-    throw new Error(`Unexpected registration response type: ${type}`);
-  }
+  let currentStage: VerificationStage = 'challenge';
+  let challengeAuditContext: Partial<ChallengeAudit> | undefined;
+  let challengeConsumption: ChallengeConsumption | undefined;
+  let challengeRecord: ChallengeContextRecord | undefined;
+  let matchedRPID: string | undefined;
 
-  // Ensure the device provided the challenge we gave it
-  if (typeof expectedChallenge === 'function') {
-    if (!(await expectedChallenge(challenge))) {
-      throw new Error(
-        `Custom challenge verifier returned false for registration response challenge "${challenge}"`,
-      );
+  try {
+    currentStage = 'challenge';
+    /**
+     * Consume the challenge synchronously before any async attestation work. Both registration
+     * and authentication share the same ledger/generation, so a challenge issued for one
+     * ceremony can't be committed by the other.
+     */
+    challengeConsumption = ChallengeContextService.consumeChallenge({
+      challenge,
+      ceremony: 'registration',
+      requireContext: requireChallengeContext,
+    });
+    challengeRecord = challengeConsumption.record;
+
+    if (challengeConsumption.tracked) {
+      challengeAuditContext = {
+        ceremony: 'registration',
+        stage: currentStage,
+        location: `${REGISTRATION_SOURCE}#challenge`,
+        reason: 'challenge context check',
+        actualOrigin: origin,
+        expectedOrigins: challengeRecord?.context.origins ?? [],
+        callerExpectedOrigins: asArray(expectedOrigin),
+        expectedRPID: challengeRecord?.context.rpID,
+        callerExpectedRPIDs: expectedRPID ? asArray(expectedRPID) : undefined,
+        tenant: sessionTenantID,
+        challengeTenant: challengeRecord?.context.tenant,
+        challengeID: challengeConsumption.challengeID,
+        generation: challengeConsumption.generation,
+        currentGeneration: ChallengeContextService.generation,
+      };
     }
-  } else if (challenge !== expectedChallenge) {
-    throw new Error(
-      `Unexpected registration response challenge "${challenge}", expected "${expectedChallenge}"`,
-    );
-  }
 
-  // Check that the origin is our site
-  matchExpectedOrigin(origin, expectedOrigin);
-
-  if (tokenBinding) {
-    if (typeof tokenBinding !== 'object') {
-      throw new Error(`Unexpected value for TokenBinding "${tokenBinding}"`);
+    if (challengeConsumption.tracked && challengeConsumption.status !== 'available') {
+      throw challengeConsumptionError({
+        consumption: challengeConsumption,
+        ceremony: 'registration',
+        audit: challengeAuditContext,
+      });
     }
 
-    if (
-      ['present', 'supported', 'not-supported'].indexOf(tokenBinding.status) < 0
+    currentStage = 'ceremony';
+    // Make sure we're handling an registration
+    if (Array.isArray(expectedType)) {
+      if (!expectedType.includes(type)) {
+        const joinedExpectedType = expectedType.join(', ');
+        throw new Error(
+          `Unexpected registration response type "${type}", expected one of: ${joinedExpectedType}`,
+        );
+      }
+    } else if (expectedType) {
+      if (type !== expectedType) {
+        throw new Error(
+          `Unexpected registration response type "${type}", expected "${expectedType}"`,
+        );
+      }
+    } else if (type !== 'webauthn.create') {
+      throw new Error(`Unexpected registration response type: ${type}`);
+    }
+
+    // Ensure the device provided the challenge we gave it
+    if (typeof expectedChallenge === 'function') {
+      const originalChallenge = challengeRecord?.envelope?.c;
+      const recordedChallenge = challengeRecord?.challenge;
+      let challengeAccepted = await expectedChallenge(challenge);
+      if (
+        !challengeAccepted &&
+        originalChallenge !== undefined &&
+        originalChallenge !== challenge
+      ) {
+        // Preserve compatibility with callers that verify the pre-envelope custom challenge.
+        challengeAccepted = await expectedChallenge(originalChallenge);
+      }
+      if (
+        !challengeAccepted &&
+        recordedChallenge !== undefined &&
+        recordedChallenge !== challenge
+      ) {
+        challengeAccepted = await expectedChallenge(recordedChallenge);
+      }
+      if (!challengeAccepted) {
+        throw new Error(
+          `Custom challenge verifier returned false for registration response challenge "${challenge}"`,
+        );
+      }
+    } else if (
+      challenge !== expectedChallenge &&
+      expectedChallenge !== challengeRecord?.challenge &&
+      !(challengeRecord?.envelope?.c !== undefined &&
+        expectedChallenge === challengeRecord?.envelope?.c)
     ) {
       throw new Error(
-        `Unexpected tokenBinding.status value of "${tokenBinding.status}"`,
+        `Unexpected registration response challenge "${challenge}", expected "${expectedChallenge}"`,
       );
     }
-  }
 
-  const attestationObject = isoBase64URL.toBuffer(
-    attestationResponse.attestationObject,
-  );
-  const decodedAttestationObject = decodeAttestationObject(attestationObject);
-  const fmt = decodedAttestationObject.get('fmt');
-  const authData = decodedAttestationObject.get('authData');
-  const attStmt = decodedAttestationObject.get('attStmt');
+    // Check that the origin is our site. A challenge context additionally pins the origin(s) that
+    // were allowed when the options were generated.
+    currentStage = 'origin';
+    matchExpectedOrigin(origin, expectedOrigin, challengeAuditContext);
 
-  const parsedAuthData = parseAuthenticatorData(authData);
-  const {
-    aaguid,
-    rpIdHash,
-    flags,
-    credentialID,
-    counter,
-    credentialPublicKey,
-    extensionsData,
-  } = parsedAuthData;
+    if (tokenBinding) {
+      if (typeof tokenBinding !== 'object') {
+        throw new Error(`Unexpected value for TokenBinding "${tokenBinding}"`);
+      }
 
-  // Make sure the response's RP ID is ours
-  let matchedRPID: string | undefined;
-  if (expectedRPID) {
-    let expectedRPIDs: string[] = [];
-    if (typeof expectedRPID === 'string') {
-      expectedRPIDs = [expectedRPID];
+      if (
+        ['present', 'supported', 'not-supported'].indexOf(tokenBinding.status) < 0
+      ) {
+        throw new Error(
+          `Unexpected tokenBinding.status value of "${tokenBinding.status}"`,
+        );
+      }
+    }
+
+    const attestationObject = isoBase64URL.toBuffer(
+      attestationResponse.attestationObject,
+    );
+    const decodedAttestationObject = decodeAttestationObject(attestationObject);
+    const fmt = decodedAttestationObject.get('fmt');
+    const authData = decodedAttestationObject.get('authData');
+    const attStmt = decodedAttestationObject.get('attStmt');
+
+    const parsedAuthData = parseAuthenticatorData(authData);
+    const {
+      aaguid,
+      rpIdHash,
+      flags,
+      credentialID,
+      counter,
+      credentialPublicKey,
+      extensionsData,
+    } = parsedAuthData;
+
+    // Make sure the response's RP ID is ours. When a challenge context is present its RP ID is
+    // authoritative even if the caller didn't repeat `expectedRPID`.
+    currentStage = 'rp_id';
+    const expectedRPIDs = expectedRPID
+      ? asArray(expectedRPID)
+      : challengeRecord
+      ? [challengeRecord.context.rpID]
+      : undefined;
+
+    if (expectedRPIDs) {
+      matchedRPID = await matchExpectedRPID(
+        rpIdHash,
+        expectedRPIDs,
+        challengeAuditContext,
+      );
+    }
+
+    if (challengeRecord && matchedRPID) {
+      assertChallengeResponseContext({
+        record: challengeRecord,
+        ceremony: 'registration',
+        actualOrigin: origin,
+        actualRPID: matchedRPID,
+        sessionTenant: sessionTenantID,
+        auditContext: challengeAuditContext,
+      });
+    }
+
+    currentStage = 'user_verification';
+    // Make sure someone was physically present
+    if (requireUserPresence && !flags.up) {
+      throw new Error('User presence was required, but user was not present');
+    }
+
+    // Enforce user verification if specified
+    if (requireUserVerification && !flags.uv) {
+      throw new Error(
+        'User verification was required, but user could not be verified',
+      );
+    }
+
+    currentStage = 'challenge';
+    if (!credentialID) {
+      throw new Error('No credential ID was provided by authenticator');
+    }
+
+    if (!credentialPublicKey) {
+      throw new Error('No public key was provided by authenticator');
+    }
+
+    if (!aaguid) {
+      throw new Error('No AAGUID was present during registration');
+    }
+
+    const decodedPublicKey = decodeCredentialPublicKey(credentialPublicKey);
+    const pubKeyAlg = decodedPublicKey.get(COSEKEYS.alg);
+
+    if (typeof pubKeyAlg !== 'number') {
+      throw new Error('Credential public key was missing numeric alg');
+    }
+
+    // Make sure the key algorithm is one we specified within the registration options
+    if (!supportedAlgorithmIDs.includes(pubKeyAlg as number)) {
+      const supported = supportedAlgorithmIDs.join(', ');
+      throw new Error(
+        `Unexpected public key alg "${pubKeyAlg}", expected one of "${supported}"`,
+      );
+    }
+
+    /**
+     * If the runtime doesn't support PQC passkeys then terminate here at the first sign of a PQC
+     * algorithm so that downstream issues that arise due to lack of PQC support won't get masked as
+     * unexpected behavior.
+     *
+     * I'm choosing to raise here even if attestation is "none" because it feels weird to allow an RP
+     * to parse a registration response w/o attestation only to encounter failure when trying to auth
+     * with the PQC passkey and the runtime doesn't support PQC.
+     */
+    if (isPQCCOSEAlg(pubKeyAlg) && !SettingsService.runtimeSupportsPQC()) {
+      throw new PQCNotSupportedError(pubKeyAlg);
+    }
+
+    const clientDataHash = await toHash(
+      isoBase64URL.toBuffer(attestationResponse.clientDataJSON),
+    );
+    const rootCertificates = SettingsService.getRootCertificates({ identifier: fmt });
+
+    // Prepare arguments to pass to the relevant verification method
+    const verifierOpts: AttestationFormatVerifierOpts = {
+      aaguid,
+      attStmt,
+      authData,
+      clientDataHash,
+      credentialID,
+      credentialPublicKey,
+      rootCertificates,
+      rpIdHash,
+      attestationSafetyNetEnforceCTSCheck,
+    };
+
+    /**
+     * Verification can only be performed when attestation = 'direct'
+     */
+    currentStage = 'signature';
+    let verified = false;
+    if (fmt === 'fido-u2f') {
+      verified = await verifyAttestationFIDOU2F(verifierOpts);
+    } else if (fmt === 'packed') {
+      verified = await verifyAttestationPacked(verifierOpts);
+    } else if (fmt === 'android-safetynet') {
+      verified = await verifyAttestationAndroidSafetyNet(verifierOpts);
+    } else if (fmt === 'android-key') {
+      verified = await verifyAttestationAndroidKey(verifierOpts);
+    } else if (fmt === 'tpm') {
+      verified = await verifyAttestationTPM(verifierOpts);
+    } else if (fmt === 'apple') {
+      verified = await verifyAttestationApple(verifierOpts);
+    } else if (fmt === 'none') {
+      if (attStmt.size > 0) {
+        throw new Error('None attestation had unexpected attestation statement');
+      }
+      // This is the weaker of the attestations, so there's nothing else to really check
+      verified = true;
     } else {
-      expectedRPIDs = expectedRPID;
+      throw new Error(`Unsupported Attestation Format: ${fmt}`);
     }
 
-    matchedRPID = await matchExpectedRPID(rpIdHash, expectedRPIDs);
-  }
-
-  // Make sure someone was physically present
-  if (requireUserPresence && !flags.up) {
-    throw new Error('User presence was required, but user was not present');
-  }
-
-  // Enforce user verification if specified
-  if (requireUserVerification && !flags.uv) {
-    throw new Error(
-      'User verification was required, but user could not be verified',
-    );
-  }
-
-  if (!credentialID) {
-    throw new Error('No credential ID was provided by authenticator');
-  }
-
-  if (!credentialPublicKey) {
-    throw new Error('No public key was provided by authenticator');
-  }
-
-  if (!aaguid) {
-    throw new Error('No AAGUID was present during registration');
-  }
-
-  const decodedPublicKey = decodeCredentialPublicKey(credentialPublicKey);
-  const pubKeyAlg = decodedPublicKey.get(COSEKEYS.alg);
-
-  if (typeof pubKeyAlg !== 'number') {
-    throw new Error('Credential public key was missing numeric alg');
-  }
-
-  // Make sure the key algorithm is one we specified within the registration options
-  if (!supportedAlgorithmIDs.includes(pubKeyAlg as number)) {
-    const supported = supportedAlgorithmIDs.join(', ');
-    throw new Error(
-      `Unexpected public key alg "${pubKeyAlg}", expected one of "${supported}"`,
-    );
-  }
-
-  /**
-   * If the runtime doesn't support PQC passkeys then terminate here at the first sign of a PQC
-   * algorithm so that downstream issues that arise due to lack of PQC support won't get masked as
-   * unexpected behavior.
-   *
-   * I'm choosing to raise here even if attestation is "none" because it feels weird to allow an RP
-   * to parse a registration response w/o attestation only to encounter failure when trying to auth
-   * with the PQC passkey and the runtime doesn't support PQC.
-   */
-  if (isPQCCOSEAlg(pubKeyAlg) && !SettingsService.runtimeSupportsPQC()) {
-    throw new PQCNotSupportedError(pubKeyAlg);
-  }
-
-  const clientDataHash = await toHash(isoBase64URL.toBuffer(attestationResponse.clientDataJSON));
-  const rootCertificates = SettingsService.getRootCertificates({ identifier: fmt });
-
-  // Prepare arguments to pass to the relevant verification method
-  const verifierOpts: AttestationFormatVerifierOpts = {
-    aaguid,
-    attStmt,
-    authData,
-    clientDataHash,
-    credentialID,
-    credentialPublicKey,
-    rootCertificates,
-    rpIdHash,
-    attestationSafetyNetEnforceCTSCheck,
-  };
-
-  /**
-   * Verification can only be performed when attestation = 'direct'
-   */
-  let verified = false;
-  if (fmt === 'fido-u2f') {
-    verified = await verifyAttestationFIDOU2F(verifierOpts);
-  } else if (fmt === 'packed') {
-    verified = await verifyAttestationPacked(verifierOpts);
-  } else if (fmt === 'android-safetynet') {
-    verified = await verifyAttestationAndroidSafetyNet(verifierOpts);
-  } else if (fmt === 'android-key') {
-    verified = await verifyAttestationAndroidKey(verifierOpts);
-  } else if (fmt === 'tpm') {
-    verified = await verifyAttestationTPM(verifierOpts);
-  } else if (fmt === 'apple') {
-    verified = await verifyAttestationApple(verifierOpts);
-  } else if (fmt === 'none') {
-    if (attStmt.size > 0) {
-      throw new Error('None attestation had unexpected attestation statement');
+    if (!verified) {
+      return { verified: false };
     }
-    // This is the weaker of the attestations, so there's nothing else to really check
-    verified = true;
-  } else {
-    throw new Error(`Unsupported Attestation Format: ${fmt}`);
-  }
 
-  if (!verified) {
-    return { verified: false };
-  }
+    currentStage = 'commit';
+    const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
+    const formattedAAGUID = convertAAGUIDToString(aaguid);
+    // Try to pull provider metadata from either MDS service,
+    const providerMetadata = await MetadataService.getProviderMetadata(formattedAAGUID) ??
+      await ConvenienceMetadataService.getProviderMetadata(formattedAAGUID);
 
-  const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
-  const formattedAAGUID = convertAAGUIDToString(aaguid);
-  // Try to pull provider metadata from either MDS service,
-  const providerMetadata = await MetadataService.getProviderMetadata(formattedAAGUID) ??
-    await ConvenienceMetadataService.getProviderMetadata(formattedAAGUID);
+    if (challengeRecord) {
+      assertChallengeGenerationCurrent({
+        record: challengeRecord,
+        ceremony: 'registration',
+        actualOrigin: origin,
+        actualRPID: matchedRPID ?? challengeRecord.context.rpID,
+        sessionTenant: sessionTenantID,
+        auditContext: challengeAuditContext,
+      });
+    }
 
-  return {
-    verified: true,
-    registrationInfo: {
+    const registrationInfo: Extract<
+      VerifiedRegistrationResponse,
+      { verified: true }
+    >['registrationInfo'] = {
       fmt,
       aaguid: formattedAAGUID,
       passkeyProviderMetadata: providerMetadata,
@@ -307,8 +479,38 @@ export async function verifyRegistrationResponse(
       origin: clientDataJSON.origin,
       rpID: matchedRPID,
       authenticatorExtensionResults: extensionsData,
-    },
-  };
+    };
+
+    if (challengeRecord && challengeConsumption) {
+      const session: VerifiedSessionIdentity = {
+        origin: clientDataJSON.origin,
+        rpID: matchedRPID ?? challengeRecord.context.rpID,
+        tenant: challengeRecord.context.tenant,
+        challengeID: challengeConsumption.challengeID,
+        generation: challengeConsumption.generation,
+      };
+      registrationInfo.session = session;
+      registrationInfo.challengeContext = session;
+      registrationInfo.finalSession = session;
+      registrationInfo.tenant = session.tenant;
+      registrationInfo.challengeID = session.challengeID;
+      registrationInfo.generation = session.generation;
+    }
+
+    return {
+      verified: true,
+      registrationInfo,
+    };
+  } catch (error) {
+    rethrowWithChallengeAudit({
+      error,
+      ceremony: 'registration',
+      stage: currentStage,
+      auditContext: challengeAuditContext,
+      actualOrigin: origin,
+      actualRPID: matchedRPID,
+    });
+  }
 }
 
 /**
@@ -340,6 +542,8 @@ export async function verifyRegistrationResponse(
  * specified in the registration options
  * @param registrationInfo?.authenticatorExtensionResults The authenticator extensions returned
  * by the browser
+ * @param registrationInfo?.session The verified challenge/session identity to use when committing
+ * the new credential. Only present when the challenge used a challenge context.
  */
 export type VerifiedRegistrationResponse = {
   verified: false;
@@ -359,6 +563,18 @@ export type VerifiedRegistrationResponse = {
     origin: string;
     rpID?: string;
     authenticatorExtensionResults?: AuthenticationExtensionsAuthenticatorOutputs;
+    /** Tenant frozen into the challenge, copied from the verified session */
+    tenant?: string;
+    /** Handle of the consumed challenge */
+    challengeID?: string;
+    /** Generation of the consumed challenge */
+    generation?: number;
+    /** Verified origin/RP ID/tenant identity for the final session */
+    session?: VerifiedSessionIdentity;
+    /** Alias for `session` */
+    challengeContext?: VerifiedSessionIdentity;
+    /** Alias for `session` */
+    finalSession?: VerifiedSessionIdentity;
   };
 };
 

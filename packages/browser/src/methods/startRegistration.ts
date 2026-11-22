@@ -72,7 +72,8 @@ export async function startRegistration(
   // Finalize options
   createOptions.publicKey = publicKey;
   // Set up the ability to cancel this request if the user attempts another
-  createOptions.signal = WebAuthnAbortService.createNewAbortSignal();
+  const abortSignal = WebAuthnAbortService.createNewAbortSignal();
+  createOptions.signal = abortSignal;
 
   // Wait for the user to complete attestation
   let credential;
@@ -87,6 +88,18 @@ export async function startRegistration(
 
   if (!credential) {
     throw new Error('Registration was not completed');
+  }
+
+  /**
+   * As with authentication, a stale registration result must not be delivered to a newer
+   * ceremony/page after the original ceremony was superseded or cancelled.
+   */
+  if (!WebAuthnAbortService.isCurrentCeremony(abortSignal)) {
+    const abortError = new Error(
+      'Registration ceremony was superseded or cancelled before its result could be used',
+    );
+    abortError.name = 'AbortError';
+    throw identifyRegistrationError({ error: abortError, options: createOptions });
   }
 
   const { id, rawId, response, type } = credential;

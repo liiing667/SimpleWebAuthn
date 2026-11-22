@@ -51,3 +51,20 @@ Deno.test('should cancel active WebAuthn ceremony when manually cancelled', () =
   // @ts-ignore: Ignore the fact that `controller` is private
   assertEquals(WebAuthnAbortService.controller, undefined);
 });
+
+Deno.test('should only report the most recently created signal as current', () => {
+  const signal1 = WebAuthnAbortService.createNewAbortSignal();
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(signal1), true);
+
+  const signal2 = WebAuthnAbortService.createNewAbortSignal();
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(signal1), false);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(signal2), true);
+});
+
+Deno.test('should report no current ceremony after manual cancellation', () => {
+  const signal = WebAuthnAbortService.createNewAbortSignal();
+  WebAuthnAbortService.cancelCeremony();
+
+  assertEquals(signal.aborted, true);
+  assertEquals(WebAuthnAbortService.isCurrentCeremony(signal), false);
+});

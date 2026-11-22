@@ -1,6 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 
 import { isoBase64URL } from '../helpers/iso/index.ts';
+import { ChallengeContextService } from '../services/challengeContextService.ts';
 
 import { generateAuthenticationOptions } from './generateAuthenticationOptions.ts';
 
@@ -146,4 +147,38 @@ Deno.test('should treat string challenges as UTF-8 strings', async () => {
     options.challenge,
     '44GT44KT44Gr44Gh44Gv',
   );
+});
+
+Deno.test('should freeze origin, RP ID and tenant when a challenge context is supplied', async () => {
+  ChallengeContextService.reset();
+
+  const options = await generateAuthenticationOptions({
+    rpID,
+    challenge: challengeBuffer,
+    challengeContext: {
+      expectedOrigin: ['https://tenant-a.example.com'],
+      rpID,
+      tenant: 'tenant-a',
+    },
+  });
+
+  assert(isoBase64URL.isBase64URL(options.challenge));
+
+  const record = ChallengeContextService.getChallenge(options.challenge);
+  assertEquals(record?.context.origins, ['https://tenant-a.example.com']);
+  assertEquals(record?.context.rpID, rpID);
+  assertEquals(record?.context.tenant, 'tenant-a');
+  assertEquals(record?.ceremony, 'authentication');
+});
+
+Deno.test('should not change the challenge shape without a challenge context', async () => {
+  ChallengeContextService.reset();
+
+  const options = await generateAuthenticationOptions({
+    rpID,
+    challenge: challengeBuffer,
+  });
+
+  assertEquals(options.challenge, challengeString);
+  assertEquals(ChallengeContextService.getChallenge(options.challenge), undefined);
 });
