@@ -4,7 +4,7 @@ import type {
   Uint8Array_,
   WebAuthnCredential,
 } from '../types/index.ts';
-import { PQCNotSupportedError } from '../errors/index.ts';
+import { PQCNotSupportedError, SimpleWebAuthnError } from '../errors/index.ts';
 import {
   type AttestationFormat,
   type AttestationStatement,
@@ -23,6 +23,7 @@ import { isoBase64URL } from '../helpers/iso/index.ts';
 import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
+import { RegistrationChallengeService } from '../services/registrationChallengeService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
 
 import { getDefaultSupportedAlgorithmIDs } from './generateRegistrationOptions.ts';
@@ -49,6 +50,10 @@ export type VerifyRegistrationResponseOpts = Parameters<typeof verifyRegistratio
  * @param expectedOrigin - Website URL (or array of URLs) that the registration should have occurred on
  * @param expectedRPID - RP ID (or array of IDs) that was specified in the registration options
  * @param expectedType **(Optional)** - The response type expected ('webauthn.create')
+ * @param expectedUserID **(Optional)** - The base64url-encoded user ID (or the raw bytes used to
+ * generate it) that this registration belongs to. When provided, the challenge must have been
+ * generated for this user ID, which prevents a registration response from being replayed into a
+ * different account
  * @param requireUserPresence **(Optional)** - Enforce user presence by the authenticator (or skip it during auto registration) Defaults to `true`
  * @param requireUserVerification **(Optional)** - Enforce user verification by the authenticator (via PIN, fingerprint, etc...) Defaults to `true`
  * @param supportedAlgorithmIDs **(Optional)** - Array of numeric COSE algorithm identifiers indicating supported public key algorithms. Import `COSEALG` from \@simplewebauthn/server/helpers for suitable values. Should be the same value that was specified for this same argument when calling `generateRegistrationOptions()`. Defaults to `[COSEALG.EdDSA, COSEALG.ES256, COSEALG.RS256]`
@@ -61,6 +66,7 @@ export async function verifyRegistrationResponse(
     expectedOrigin: string | string[];
     expectedRPID?: string | string[];
     expectedType?: string | string[];
+    expectedUserID?: string | Uint8Array_;
     requireUserPresence?: boolean;
     requireUserVerification?: boolean;
     supportedAlgorithmIDs?: number[];
@@ -68,16 +74,51 @@ export async function verifyRegistrationResponse(
   },
 ): Promise<VerifiedRegistrationResponse> {
   const {
-    response,
-    expectedChallenge,
-    expectedOrigin,
-    expectedRPID,
-    expectedType,
+    response: originalResponse,
+    expectedChallenge: originalExpectedChallenge,
+    expectedOrigin: originalExpectedOrigin,
+    expectedRPID: originalExpectedRPID,
+    expectedType: originalExpectedType,
+    expectedUserID: originalExpectedUserID,
     requireUserPresence = true,
     requireUserVerification = true,
-    supportedAlgorithmIDs = getDefaultSupportedAlgorithmIDs(),
+    supportedAlgorithmIDs: originalSupportedAlgorithmIDs = getDefaultSupportedAlgorithmIDs(),
     attestationSafetyNetEnforceCTSCheck = true,
   } = options;
+
+  /**
+   * Freeze the submitted response and the caller-provided expectations before any async work
+   * begins. Verification spans multiple awaits, during which a shared response object could be
+   * mutated by a concurrent submission or a retry. Using a snapshot keeps the challenge, the
+   * attestation object, and the returned credential identity tied to the same submission.
+   */
+  const originalAttestationResponse = originalResponse.response;
+  const response: RegistrationResponseJSON = {
+    ...originalResponse,
+    response: {
+      ...originalAttestationResponse,
+      transports: originalAttestationResponse.transports
+        ? [...originalAttestationResponse.transports]
+        : undefined,
+    },
+  };
+  const expectedChallenge = originalExpectedChallenge;
+  const expectedOrigin = Array.isArray(originalExpectedOrigin)
+    ? [...originalExpectedOrigin]
+    : originalExpectedOrigin;
+  const expectedRPID = Array.isArray(originalExpectedRPID)
+    ? [...originalExpectedRPID]
+    : originalExpectedRPID;
+  const expectedType = Array.isArray(originalExpectedType)
+    ? [...originalExpectedType]
+    : originalExpectedType;
+  const supportedAlgorithmIDs = [...originalSupportedAlgorithmIDs];
+  const expectedUserID = typeof originalExpectedUserID === 'string'
+    ? isoBase64URL.trimPadding(originalExpectedUserID)
+    : originalExpectedUserID
+    ? isoBase64URL.fromBuffer(originalExpectedUserID)
+    : undefined;
+
   const { id, rawId, type: credentialType, response: attestationResponse } = response;
 
   // Ensure credential specified an ID
@@ -119,6 +160,42 @@ export async function verifyRegistrationResponse(
     }
   } else if (type !== 'webauthn.create') {
     throw new Error(`Unexpected registration response type: ${type}`);
+  }
+
+  /**
+   * Consume the challenge synchronously and as soon as it's clear this is a registration
+   * response. If the challenge was issued by this process, a submission bearing it is consumed
+   * even when a later check (the caller's challenge verifier, origin, attestation, or a timeout
+   * while saving) fails. Concurrent submissions therefore race on a single pending -> used
+   * transition instead of each starting verification.
+   */
+  const challengeConsumption = RegistrationChallengeService.consumeChallenge(challenge);
+  if (challengeConsumption.tracked && challengeConsumption.status !== 'available') {
+    if (challengeConsumption.status === 'expired') {
+      throw new SimpleWebAuthnError({
+        message: `Registration challenge "${challenge}" has expired`,
+        code: 'REGISTRATION_CHALLENGE_EXPIRED',
+      });
+    }
+
+    throw new SimpleWebAuthnError({
+      message: `Registration challenge "${challenge}" has already been used`,
+      code: 'REGISTRATION_CHALLENGE_ALREADY_USED',
+    });
+  }
+
+  if (
+    challengeConsumption.tracked &&
+    challengeConsumption.record.userIDWasProvided &&
+    expectedUserID !== undefined &&
+    expectedUserID !== challengeConsumption.record.userID
+  ) {
+    throw new SimpleWebAuthnError({
+      message:
+        `Registration response user ID "${expectedUserID}" does not match the user ID ` +
+        `"${challengeConsumption.record.userID}" for which the challenge was generated`,
+      code: 'UNEXPECTED_USER_ID',
+    });
   }
 
   // Ensure the device provided the challenge we gave it
@@ -281,6 +358,59 @@ export async function verifyRegistrationResponse(
     return { verified: false };
   }
 
+  const credentialIDString = isoBase64URL.fromBuffer(credentialID);
+  const challengeUserID = challengeConsumption.tracked
+    ? challengeConsumption.record.userID
+    : undefined;
+  const userIDForCredential = expectedUserID ?? challengeUserID;
+  const stableUserID = expectedUserID !== undefined ||
+    (challengeConsumption.tracked && challengeConsumption.record.userIDWasProvided);
+
+  /**
+   * A credential ID is globally unique. Once it has been consumed for an account with a stable
+   * user ID it must not be accepted again, including when it's replayed under a challenge for a
+   * different account. When both registrations only used a library-generated random user ID there
+   * is no stable account identity to compare, so leave those independent flows untouched. The
+   * exception is `"none"` attestation: it doesn't sign `clientDataJSON`, so its credential IDs
+   * must be consumed globally even without a stable user ID.
+   */
+  const enforceCredentialUniqueness = stableUserID || fmt === 'none';
+  const existingCredential = RegistrationChallengeService.getCredential(credentialIDString);
+  if (existingCredential && enforceCredentialUniqueness) {
+    const existingUserID = existingCredential.userID;
+    const userDescription = existingUserID && existingUserID !== userIDForCredential
+      ? ` and is already bound to another user ID ("${existingUserID}")`
+      : '';
+    throw new SimpleWebAuthnError({
+      message:
+        `Registration credential "${credentialIDString}" has already been used${userDescription}`,
+      code: 'REGISTRATION_CREDENTIAL_ALREADY_USED',
+    });
+  }
+
+  if (!existingCredential && enforceCredentialUniqueness) {
+    let credentialTrackingKey: string | undefined;
+    if (expectedUserID !== undefined) {
+      credentialTrackingKey = `user:${expectedUserID}`;
+    } else if (challengeConsumption.tracked) {
+      credentialTrackingKey = challengeConsumption.record.trackingKey;
+    }
+
+    const credentialConsumption = RegistrationChallengeService.consumeCredential({
+      credentialID: credentialIDString,
+      userID: userIDForCredential,
+      trackingKey: credentialTrackingKey,
+      userIDWasProvided: stableUserID,
+      transports: attestationResponse.transports,
+    });
+    if (!credentialConsumption.consumed) {
+      throw new SimpleWebAuthnError({
+        message: `Registration credential "${credentialIDString}" has already been used`,
+        code: 'REGISTRATION_CREDENTIAL_ALREADY_USED',
+      });
+    }
+  }
+
   const { credentialDeviceType, credentialBackedUp } = parseBackupFlags(flags);
   const formattedAAGUID = convertAAGUIDToString(aaguid);
   // Try to pull provider metadata from either MDS service,
@@ -295,7 +425,7 @@ export async function verifyRegistrationResponse(
       passkeyProviderMetadata: providerMetadata,
       credentialType,
       credential: {
-        id: isoBase64URL.fromBuffer(credentialID),
+        id: credentialIDString,
         publicKey: credentialPublicKey,
         counter,
         transports: response.response.transports,

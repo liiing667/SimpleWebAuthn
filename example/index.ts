@@ -120,6 +120,12 @@ app.get('/generate-registration-options', async (req, res) => {
   const opts: GenerateRegistrationOptionsOpts = {
     rpName: 'SimpleWebAuthn Example',
     rpID,
+    /**
+     * Bind the registration to this user's stable internal ID. This lets the server associate the
+     * challenge with the user, so a captured registration response can't be replayed into another
+     * account.
+     */
+    userID: new TextEncoder().encode(user.id),
     userName: username,
     timeout: 60000,
     attestationType: 'none',
@@ -166,6 +172,11 @@ app.post('/verify-registration', async (req, res) => {
   const user = inMemoryUserDB[loggedInUserId];
 
   const expectedChallenge = req.session.currentChallenge;
+  /**
+   * Consume the challenge before verification so a retry can't reuse it, even if the RP is slow
+   * to save the newly registered credential.
+   */
+  req.session.currentChallenge = undefined;
 
   let verification: VerifiedRegistrationResponse;
   try {
@@ -174,6 +185,7 @@ app.post('/verify-registration', async (req, res) => {
       expectedChallenge: `${expectedChallenge}`,
       expectedOrigin,
       expectedRPID: rpID,
+      expectedUserID: new TextEncoder().encode(user.id),
       requireUserVerification: false,
     };
     verification = await verifyRegistrationResponse(opts);
@@ -203,8 +215,6 @@ app.post('/verify-registration', async (req, res) => {
       user.credentials.push(newCredential);
     }
   }
-
-  req.session.currentChallenge = undefined;
 
   res.send({ verified });
 });

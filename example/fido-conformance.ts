@@ -164,6 +164,8 @@ fidoConformanceRouter.post('/attestation/result', async (req, res) => {
   const user = inMemoryUserDB[`${loggedInUsername}`];
 
   const expectedChallenge = req.session.currentChallenge;
+  // Consume the registration challenge before verification so it can't be replayed on retry
+  req.session.currentChallenge = undefined;
 
   let verification;
   try {
@@ -171,6 +173,7 @@ fidoConformanceRouter.post('/attestation/result', async (req, res) => {
       response: body,
       expectedChallenge: `${expectedChallenge}`,
       expectedOrigin,
+      expectedUserID: isoBase64URL.toBuffer(user.id),
       supportedAlgorithmIDs,
       requireUserVerification: false,
     });

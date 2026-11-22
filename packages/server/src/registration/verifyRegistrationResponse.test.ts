@@ -1,8 +1,10 @@
 import { assert, assertEquals, assertFalse, assertObjectMatch, assertRejects } from '@std/assert';
 import { assertSpyCall, assertSpyCalls, resolvesNext, returnsNext, stub } from '@std/testing/mock';
+import { beforeEach } from '@std/testing/bdd';
 import { FakeTime } from '@std/testing/time';
 
 import { verifyRegistrationResponse } from './verifyRegistrationResponse.ts';
+import { generateRegistrationOptions } from './generateRegistrationOptions.ts';
 import type { RegistrationResponseJSON } from '../types/index.ts';
 import {
   _decodeAttestationObjectInternals,
@@ -22,6 +24,7 @@ import { denoSupportsPQC, FIDO_Conformance_Fake_Root } from '../helpers/tests/in
 import { SettingsService } from '../services/settingsService.ts';
 import { MetadataService } from '../services/metadataService.ts';
 import { ConvenienceMetadataService } from '../services/convenienceMetadataService.ts';
+import { RegistrationChallengeService } from '../services/registrationChallengeService.ts';
 import type { ProviderMetadata } from '../metadata/convenienceMDSTypes.ts';
 import { SimpleWebAuthnError } from '../errors/index.ts';
 
@@ -32,6 +35,16 @@ import { SimpleWebAuthnError } from '../errors/index.ts';
 SettingsService.setRootCertificates({
   identifier: 'android-key',
   certificates: [FIDO_Conformance_Fake_Root],
+});
+
+/**
+ * The fixtures below are replayed across many tests, including several verifications of the same
+ * "none" attestation credential. Start from a clean ledger so the single-use challenge and
+ * credential-ID tracking added to `verifyRegistrationResponse()` doesn't leak between the
+ * pre-existing tests below.
+ */
+beforeEach(() => {
+  RegistrationChallengeService.reset();
 });
 
 Deno.test('should verify FIDO U2F attestation', async () => {
@@ -1528,3 +1541,429 @@ const attestationNone: RegistrationResponseJSON = {
 const attestationNoneChallenge = isoBase64URL.fromUTF8String(
   'hEccPWuziP00H0p5gxh2_u5_PC4NeYgd',
 );
+
+/**
+ * Attestation format "none" doesn't sign clientDataJSON, so its challenge can be swapped for
+ * tests that need a response for a challenge generated at runtime.
+ */
+function attestationNoneForChallenge(challenge: string): RegistrationResponseJSON {
+  const clientDataJSON = isoBase64URL.fromUTF8String(
+    JSON.stringify({
+      type: 'webauthn.create',
+      challenge,
+      origin: 'https://dev.dontneeda.pw',
+    }),
+  );
+
+  return {
+    ...attestationNone,
+    response: {
+      ...attestationNone.response,
+      clientDataJSON,
+    },
+  };
+}
+
+Deno.test('should consume a registration challenge only once', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'single-use@example.com',
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  const first = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: options.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+  });
+  assert(first.verified);
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: options.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+      }),
+    Error,
+    'already been used',
+  );
+});
+
+Deno.test('should verify the response snapshot despite mid-flight mutation', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'snapshot@example.com',
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+  const expectedCredentialID = attestationNone.id;
+
+  const verification = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: (challenge) => {
+      // A concurrent submission or retry could mutate shared state while verification is in
+      // flight. The snapshot taken at the start must remain authoritative.
+      response.id = 'mutated';
+      response.rawId = 'mutated';
+      response.response.attestationObject = 'mutated';
+      response.response.clientDataJSON = 'mutated';
+      return challenge === options.challenge;
+    },
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+  });
+
+  assert(verification.verified);
+  assertEquals(verification.registrationInfo?.credential.id, expectedCredentialID);
+});
+
+Deno.test('should consume a registration challenge even if verification fails', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'failed-retry@example.com',
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: options.challenge,
+        expectedOrigin: 'https://not-the-right-origin.example.com',
+        expectedRPID: 'dev.dontneeda.pw',
+      }),
+    Error,
+    'Unexpected response origin',
+  );
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: options.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+      }),
+    Error,
+    'already been used',
+  );
+});
+
+Deno.test('should consume a registration challenge once under concurrency', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'concurrent@example.com',
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  const results = await Promise.allSettled([
+    verifyRegistrationResponse({
+      response,
+      expectedChallenge: options.challenge,
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      expectedRPID: 'dev.dontneeda.pw',
+    }),
+    verifyRegistrationResponse({
+      response,
+      expectedChallenge: options.challenge,
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      expectedRPID: 'dev.dontneeda.pw',
+    }),
+  ]);
+
+  assertEquals(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assertEquals(results.filter((result) => result.status === 'rejected').length, 1);
+});
+
+Deno.test('should not let the same credential be bound to a different user ID', async () => {
+  RegistrationChallengeService.reset();
+
+  const firstUserID = isoUint8Array.fromUTF8String('first-user');
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'first-user@example.com',
+    userID: firstUserID,
+  });
+  const firstResponse = attestationNoneForChallenge(firstOptions.challenge);
+
+  const first = await verifyRegistrationResponse({
+    response: firstResponse,
+    expectedChallenge: firstOptions.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedUserID: firstUserID,
+  });
+  assert(first.verified);
+
+  const secondUserID = isoUint8Array.fromUTF8String('second-user');
+  const secondOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'second-user@example.com',
+    userID: secondUserID,
+  });
+  // The same authenticator data (and therefore the same credential ID) is replayed with a fresh
+  // challenge belonging to a different account. "none" attestation doesn't sign clientDataJSON,
+  // so this replay is possible without this check.
+  const replayedResponse = attestationNoneForChallenge(secondOptions.challenge);
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response: replayedResponse,
+        expectedChallenge: secondOptions.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedUserID: secondUserID,
+      }),
+    Error,
+    'already been used',
+  );
+});
+
+Deno.test('should reject a response whose user ID does not match its challenge', async () => {
+  RegistrationChallengeService.reset();
+
+  const options = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'bound-user@example.com',
+    userID: isoUint8Array.fromUTF8String('bound-user'),
+  });
+  const response = attestationNoneForChallenge(options.challenge);
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: options.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedUserID: isoUint8Array.fromUTF8String('some-other-user'),
+      }),
+    Error,
+    'does not match the user ID',
+  );
+});
+
+Deno.test('should consume "none" attestation credentials globally without user IDs', async () => {
+  RegistrationChallengeService.reset();
+
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'first-auto-user@example.com',
+  });
+  const firstResponse = attestationNoneForChallenge(firstOptions.challenge);
+  const first = await verifyRegistrationResponse({
+    response: firstResponse,
+    expectedChallenge: firstOptions.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+  });
+  assert(first.verified);
+
+  const secondOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'second-auto-user@example.com',
+  });
+  const replayedResponse = attestationNoneForChallenge(secondOptions.challenge);
+
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response: replayedResponse,
+        expectedChallenge: secondOptions.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+      }),
+    Error,
+    'already been used',
+  );
+});
+
+Deno.test('should exclude a credential whose save has not completed before a retry', async () => {
+  RegistrationChallengeService.reset();
+
+  const userID = isoUint8Array.fromUTF8String('retrying-user');
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'retrying-user@example.com',
+    userID,
+  });
+  const response = attestationNoneForChallenge(firstOptions.challenge);
+
+  const verification = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: firstOptions.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedUserID: userID,
+  });
+  assert(verification.verified);
+  const firstCredentialID = verification.registrationInfo!.credential.id;
+
+  /**
+   * Simulate a retry after the RP failed to save the first credential: the RP's own
+   * `excludeCredentials` list is still empty, but the library remembers the consumed credential.
+   */
+  const retryOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'retrying-user@example.com',
+    userID,
+  });
+
+  assert(
+    retryOptions.excludeCredentials?.some((credential) => credential.id === firstCredentialID),
+  );
+});
+
+Deno.test('should exclude an unsaved credential for an auto-generated user ID retry', async () => {
+  RegistrationChallengeService.reset();
+
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'auto-retrying-user@example.com',
+  });
+  const response = attestationNoneForChallenge(firstOptions.challenge);
+
+  const verification = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: firstOptions.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+  });
+  assert(verification.verified);
+  const firstCredentialID = verification.registrationInfo!.credential.id;
+
+  const retryOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'auto-retrying-user@example.com',
+  });
+
+  assert(
+    retryOptions.excludeCredentials?.some((credential) => credential.id === firstCredentialID),
+  );
+});
+
+Deno.test('should not leave a consumed challenge without a recoverable retry path', async () => {
+  RegistrationChallengeService.reset();
+
+  const userID = isoUint8Array.fromUTF8String('half-state-user');
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'half-state@example.com',
+    userID,
+  });
+  const response = attestationNoneForChallenge(firstOptions.challenge);
+
+  // Verification succeeds, but imagine the RP's database write then fails before the credential
+  // is persisted.
+  const verification = await verifyRegistrationResponse({
+    response,
+    expectedChallenge: firstOptions.challenge,
+    expectedOrigin: 'https://dev.dontneeda.pw',
+    expectedRPID: 'dev.dontneeda.pw',
+    expectedUserID: userID,
+  });
+  assert(verification.verified);
+  const credentialID = verification.registrationInfo!.credential.id;
+
+  // The browser retries with the same (already consumed) challenge: the half-state must not be
+  // treated as a fresh, usable registration.
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response,
+        expectedChallenge: firstOptions.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedUserID: userID,
+      }),
+    Error,
+    'already been used',
+  );
+
+  // A fresh, recovered registration for the same user still carries the unpersisted credential in
+  // `excludeCredentials` so the authenticator cannot mint a second credential for the same key.
+  const retryOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'half-state@example.com',
+    userID,
+  });
+  assert(retryOptions.challenge !== firstOptions.challenge);
+  assert(retryOptions.excludeCredentials?.some((credential) => credential.id === credentialID));
+});
+
+Deno.test('should keep concurrent two-device registration to one credential', async () => {
+  RegistrationChallengeService.reset();
+
+  const userID = isoUint8Array.fromUTF8String('two-device-user');
+  const firstOptions = await generateRegistrationOptions({
+    rpName: 'SimpleWebAuthn Test',
+    rpID: 'dev.dontneeda.pw',
+    userName: 'two-device@example.com',
+    userID,
+  });
+
+  // Two distinct devices register concurrently against the same pending challenge. Only one
+  // submission can win the single pending -> used transition; the other must fail instead of
+  // leaving a partially-persisted second credential behind.
+  const firstResponse = attestationNoneForChallenge(firstOptions.challenge);
+  const secondResponse = attestationNoneForChallenge(firstOptions.challenge);
+  const results = await Promise.allSettled([
+    verifyRegistrationResponse({
+      response: firstResponse,
+      expectedChallenge: firstOptions.challenge,
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      expectedRPID: 'dev.dontneeda.pw',
+      expectedUserID: userID,
+    }),
+    verifyRegistrationResponse({
+      response: secondResponse,
+      expectedChallenge: firstOptions.challenge,
+      expectedOrigin: 'https://dev.dontneeda.pw',
+      expectedRPID: 'dev.dontneeda.pw',
+      expectedUserID: userID,
+    }),
+  ]);
+
+  assertEquals(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assertEquals(results.filter((result) => result.status === 'rejected').length, 1);
+
+  // A follow-up retry cannot consume the challenge a second time either.
+  await assertRejects(
+    () =>
+      verifyRegistrationResponse({
+        response: firstResponse,
+        expectedChallenge: firstOptions.challenge,
+        expectedOrigin: 'https://dev.dontneeda.pw',
+        expectedRPID: 'dev.dontneeda.pw',
+        expectedUserID: userID,
+      }),
+    Error,
+    'already been used',
+  );
+});
